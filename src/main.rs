@@ -26,7 +26,14 @@ async fn main() -> Result<()> {
 
     let path = PathBuf::from_str(&dir).unwrap();
 
-    let state = read_dir(&path).await?;
-    println!("{state:#?}");
+    let res = tokio::task::spawn_blocking(move || -> Result<State> {
+        let state = read_dir(&path)?;
+        println!("{state:#?}");
+
+        Ok(state)
+    });
+
+    res.await.unwrap()?;
+
     Ok(())
 }

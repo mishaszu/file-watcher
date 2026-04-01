@@ -1,6 +1,8 @@
-use std::{fs::Metadata, os::unix::fs::MetadataExt, path::PathBuf};
-
-use tokio::fs::DirEntry;
+use std::{
+    fs::{DirEntry, Metadata},
+    os::unix::fs::MetadataExt,
+    path::PathBuf,
+};
 
 use crate::Result;
 
@@ -35,11 +37,11 @@ impl Entity {
         matches!(self, Self::Dir(_))
     }
 
-    pub async fn try_from_direntry(value: DirEntry) -> Result<Option<Self>> {
-        let file_type = value.file_type().await?;
+    pub fn try_from_direntry(value: DirEntry) -> Result<Option<Self>> {
+        let file_type = value.file_type()?;
 
         if file_type.is_file() {
-            let metadata: Metadata = value.metadata().await?;
+            let metadata: Metadata = value.metadata()?;
             Ok(Some(Self::File(FileMetadata {
                 name: value.file_name().to_string_lossy().into_owned(),
                 mtime: metadata.mtime(),
@@ -58,7 +60,6 @@ impl Entity {
 }
 
 pub enum FileEvent {
-    Report(PathBuf),
     Create(PathBuf),
     Update(PathBuf),
     Delete(PathBuf),
