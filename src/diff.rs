@@ -6,41 +6,40 @@ use crate::{
 pub fn diff_snapshots(old: &Snapshot, new: &Snapshot) -> Vec<FileEvent> {
     let mut events = Vec::new();
 
-    new.iter().for_each(|(path, entity)| {
+    for (path, entity) in new.iter() {
         if let Some(old_entity) = old.get(path) {
             match (entity, old_entity) {
-                (Entity::Dir(new_dir_metadata), Entity::Dir(old_dir_metadata)) => {
-                    if new_dir_metadata.name != old_dir_metadata.name {
-                        events.push(FileEvent::Update(path.to_owned()));
-                    }
-                }
                 (Entity::File(new_file_metadata), Entity::File(old_file_metadata)) => {
-                    if new_file_metadata.name != old_file_metadata.name {
+                    if new_file_metadata.size != old_file_metadata.size {
                         events.push(FileEvent::Update(path.to_owned()));
                     } else if new_file_metadata.mtime != old_file_metadata.mtime {
-                        if new_file_metadata.size != old_file_metadata.size {
-                            events.push(FileEvent::Update(path.to_owned()));
-                        } else if let (Some(new_hash), Some(old_hash)) = (
+                        match (
                             new_file_metadata.hash.as_ref(),
                             old_file_metadata.hash.as_ref(),
-                        ) && new_hash != old_hash
-                        {
-                            events.push(FileEvent::Update(path.to_owned()));
+                        ) {
+                            (Some(new_hash), Some(old_hash)) if new_hash == old_hash => (),
+                            // Naive approach. With async hash calculating would need another
+                            // approach to sync hashes before diff to make proper comparison
+                            _ => events.push(FileEvent::Update(path.to_owned())),
                         }
                     }
+                }
+                (Entity::File(_), Entity::Dir(_)) | (Entity::Dir(_), Entity::File(_)) => {
+                    events.push(FileEvent::Delete(path.to_owned()));
+                    events.push(FileEvent::Create(path.to_owned()));
                 }
                 _ => (),
             }
         } else {
             events.push(FileEvent::Create(path.to_owned()));
         }
-    });
+    }
 
-    old.iter().for_each(|(path, _)| {
+    for (path, _) in old.iter() {
         if !new.contains_key(path) {
             events.push(FileEvent::Delete(path.to_owned()))
         }
-    });
+    }
 
     events
 }
@@ -193,6 +192,39 @@ mod tests {
             FileEvent::Delete(PathBuf::from_str("/test5.txt").unwrap()),
             FileEvent::Create(PathBuf::from_str("/test4.txt").unwrap()),
             FileEvent::Update(PathBuf::from_str("/test/test2.txt").unwrap()),
+        ];
+        expected.sort();
+
+        assert_eq!(diff, expected);
+    }
+
+    #[test]
+    fn diff_for_type_change() {
+        let mut snapshot1: Snapshot = HashMap::new();
+        snapshot1.insert(
+            PathBuf::from_str("/test").unwrap(),
+            Entity::Dir(DirMetadata {
+                name: "test".to_string(),
+            }),
+        );
+        let mut snapshot2 = HashMap::new();
+        snapshot2.insert(
+            PathBuf::from_str("/test").unwrap(),
+            Entity::File(FileMetadata {
+                name: "text".to_string(),
+                mtime: 100,
+                size: 1000,
+                hash: None,
+            }),
+        );
+
+        let mut diff = diff_snapshots(&snapshot1, &snapshot2);
+
+        diff.sort();
+
+        let mut expected = vec![
+            FileEvent::Delete(PathBuf::from_str("/test").unwrap()),
+            FileEvent::Create(PathBuf::from_str("/test").unwrap()),
         ];
         expected.sort();
 
