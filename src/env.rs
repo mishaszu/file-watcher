@@ -11,10 +11,7 @@ impl Env {
     pub fn new() -> (Self, SinkKind) {
         let dir = env::var("WATCH_DIR").expect("WATCH_DIR should be provided in env file");
 
-        let sink_kind = match env::var("SINK_KIND") {
-            Ok(value) if &value == "stdout" => SinkKind::Stdout(StdoutSink),
-            _ => SinkKind::Stdout(StdoutSink),
-        };
+        let sink_kind = SinkKind::Stdout(StdoutSink);
 
         (
             Env {

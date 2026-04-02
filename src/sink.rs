@@ -9,12 +9,12 @@ pub enum SinkKind {
     Stdout(StdoutSink),
 }
 
-trait Sink {
+pub trait Sink {
     async fn handle(&self, event: FileEvent);
 }
 
 pub async fn sink_watcher(sink: impl Sink, mut rx: mpsc::Receiver<FileEvent>) {
-    while let Some(event) = rx.recv().await.take() {
+    while let Some(event) = rx.recv().await {
         sink.handle(event).await
     }
 }

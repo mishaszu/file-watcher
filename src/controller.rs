@@ -1,8 +1,11 @@
-use std::{path::PathBuf, time::Duration};
+use std::time::Duration;
 
 use tokio::{
     select,
-    sync::{mpsc, oneshot},
+    sync::{
+        mpsc::{self, error::TrySendError},
+        oneshot,
+    },
     time::interval,
 };
 
@@ -18,8 +21,6 @@ pub async fn controller(
     let mut ticker = interval(Duration::from_secs(config.interval_sec));
 
     let mut scan_rx: Option<oneshot::Receiver<Snapshot>> = None;
-
-    let mut counter = 0;
 
     loop {
         select! {
@@ -45,7 +46,16 @@ pub async fn controller(
                 if let Some(value) = res {
                     let diff = diff_snapshots(&state, &value);
                     for event in diff {
-                        sink_tx.send(event).await;
+                        if let Err(err) = sink_tx.try_send(event) {
+                            match err {
+                                TrySendError::Full(_)=> {
+                                    eprintln!("controller: sink channel closed; stopping controller");
+                                },
+                                TrySendError::Closed(_)=> {
+                                    eprintln!("controller: sink channel full; dropping event");
+                                }
+                            }
+                        }
                     }
                     state = value;
                 }
