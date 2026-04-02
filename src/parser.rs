@@ -1,8 +1,8 @@
 use std::{collections::HashMap, fs, path::PathBuf};
 
-use crate::{Result, Snapshot, model::Entity};
+use crate::{Result, Snapshot, model::Item};
 
-pub fn parse_dir_blocking(path: &PathBuf) -> Result<HashMap<PathBuf, Entity>> {
+pub fn parse_dir_blocking(path: &PathBuf) -> Result<Snapshot> {
     let mut content = fs::read_dir(path)?;
 
     let mut state: Snapshot = HashMap::new();
@@ -11,9 +11,9 @@ pub fn parse_dir_blocking(path: &PathBuf) -> Result<HashMap<PathBuf, Entity>> {
     while let Some(Ok(value)) = content.next() {
         let path = value.path();
 
-        let entry = Entity::try_from_direntry(value)?;
+        let entry = Item::try_from_direntry(value)?;
         if let Some(value) = entry {
-            let is_dir = value.is_dir();
+            let is_dir = value.kind.is_dir();
             if is_dir {
                 let inner_state = parse_dir_blocking(&path)?;
                 state.insert(path, value);

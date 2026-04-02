@@ -6,7 +6,8 @@ use tokio::sync::mpsc;
 
 use crate::{
     controller::controller,
-    model::{Entity, FileEvent},
+    hasher::{HasherIncomingMsg, HasherReadyMsg, hash_worker},
+    model::{FileEvent, Item},
     parser::parse_dir_blocking,
     sink::sink_watcher,
 };
@@ -14,6 +15,7 @@ use crate::{
 mod controller;
 mod diff;
 mod env;
+mod hasher;
 mod model;
 mod parser;
 mod sink;
@@ -26,24 +28,37 @@ pub enum Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
-pub type Snapshot = HashMap<PathBuf, Entity>;
+pub type Snapshot = HashMap<PathBuf, Item>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv().ok();
     let (config, sink_kind) = env::Env::new();
 
-    let (tx, rx) = mpsc::channel::<FileEvent>(100);
+    let (file_evnt_tx, file_event_rx) = mpsc::channel::<FileEvent>(100);
+    let (hash_request_tx, hash_request_rx) = mpsc::channel::<HasherIncomingMsg>(100);
+    let (hash_completion_tx, hash_completion_rx) = mpsc::channel::<HasherReadyMsg>(100);
+
+    tokio::spawn(async {
+        hash_worker(hash_request_rx, hash_completion_tx).await;
+    });
 
     tokio::spawn(async {
         match sink_kind {
-            sink::SinkKind::Stdout(sink) => sink_watcher(sink, rx).await,
+            sink::SinkKind::Stdout(sink) => sink_watcher(sink, file_event_rx).await,
         }
     });
 
     let state = parse_dir_blocking(&config.root_dir)?;
 
-    controller(config, state, tx).await?;
+    controller(
+        config,
+        state,
+        file_evnt_tx,
+        hash_request_tx,
+        hash_completion_rx,
+    )
+    .await?;
 
     Ok(())
 }
