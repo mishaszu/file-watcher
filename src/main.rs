@@ -1,11 +1,13 @@
-use std::{collections::HashMap, env, path::PathBuf, str::FromStr};
+use std::{collections::HashMap, path::PathBuf};
 
 use dotenv::dotenv;
 use thiserror::Error;
 
-use crate::model::Entity;
-use crate::parser::read_dir;
+use crate::{controller::controller, model::Entity, parser::parse_dir_blocking};
 
+mod controller;
+mod diff;
+mod env;
 mod model;
 mod parser;
 
@@ -17,23 +19,16 @@ pub enum Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
-pub type State = HashMap<PathBuf, Entity>;
+pub type Snapshot = HashMap<PathBuf, Entity>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv().ok();
-    let dir = env::var("WATCH_DIR").expect("WATCH_DIR should be provided in env file");
+    let config = env::Env::new();
 
-    let path = PathBuf::from_str(&dir).unwrap();
+    let state = parse_dir_blocking(&config.root_dir)?;
 
-    let res = tokio::task::spawn_blocking(move || -> Result<State> {
-        let state = read_dir(&path)?;
-        println!("{state:#?}");
-
-        Ok(state)
-    });
-
-    res.await.unwrap()?;
+    controller(config, state).await?;
 
     Ok(())
 }

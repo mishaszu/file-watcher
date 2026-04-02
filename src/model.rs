@@ -8,10 +8,10 @@ use crate::Result;
 
 #[derive(Debug)]
 pub struct FileMetadata {
-    name: String,
-    mtime: i64,
-    size: u64,
-    hash: Option<String>,
+    pub name: String,
+    pub mtime: i64,
+    pub size: u64,
+    pub hash: Option<String>,
 }
 
 #[derive(Debug)]
@@ -19,8 +19,7 @@ pub struct Watcher;
 
 #[derive(Debug)]
 pub struct DirMetadata {
-    name: String,
-    watcher: Option<Watcher>,
+    pub name: String,
 }
 
 #[derive(Debug)]
@@ -51,7 +50,6 @@ impl Entity {
         } else if file_type.is_dir() {
             Ok(Some(Self::Dir(DirMetadata {
                 name: value.file_name().to_string_lossy().into_owned(),
-                watcher: None,
             })))
         } else {
             Ok(None)
@@ -59,6 +57,7 @@ impl Entity {
     }
 }
 
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum FileEvent {
     Create(PathBuf),
     Update(PathBuf),
