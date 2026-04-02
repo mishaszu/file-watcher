@@ -2,14 +2,21 @@ use std::{collections::HashMap, path::PathBuf};
 
 use dotenv::dotenv;
 use thiserror::Error;
+use tokio::sync::mpsc;
 
-use crate::{controller::controller, model::Entity, parser::parse_dir_blocking};
+use crate::{
+    controller::controller,
+    model::{Entity, FileEvent},
+    parser::parse_dir_blocking,
+    sink::sink_watcher,
+};
 
 mod controller;
 mod diff;
 mod env;
 mod model;
 mod parser;
+mod sink;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -24,11 +31,19 @@ pub type Snapshot = HashMap<PathBuf, Entity>;
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv().ok();
-    let config = env::Env::new();
+    let (config, sink_kind) = env::Env::new();
+
+    let (tx, rx) = mpsc::channel::<FileEvent>(100);
+
+    tokio::spawn(async {
+        match sink_kind {
+            sink::SinkKind::Stdout(sink) => sink_watcher(sink, rx).await,
+        }
+    });
 
     let state = parse_dir_blocking(&config.root_dir)?;
 
-    controller(config, state).await?;
+    controller(config, state, tx).await?;
 
     Ok(())
 }

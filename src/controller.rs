@@ -1,15 +1,26 @@
-use std::{path::PathBuf, time::Duration};
+use std::time::Duration;
 
-use tokio::{select, sync::oneshot, time::interval};
+use tokio::{
+    select,
+    sync::{
+        mpsc::{self, error::TrySendError},
+        oneshot,
+    },
+    time::interval,
+};
 
-use crate::{Result, Snapshot, diff::diff_snapshots, env::Env, parser::parse_dir_blocking};
+use crate::{
+    Result, Snapshot, diff::diff_snapshots, env::Env, model::FileEvent, parser::parse_dir_blocking,
+};
 
-pub async fn controller(config: Env, mut state: Snapshot) -> Result<()> {
+pub async fn controller(
+    config: Env,
+    mut state: Snapshot,
+    sink_tx: mpsc::Sender<FileEvent>,
+) -> Result<()> {
     let mut ticker = interval(Duration::from_secs(config.interval_sec));
 
     let mut scan_rx: Option<oneshot::Receiver<Snapshot>> = None;
-
-    let mut counter = 0;
 
     loop {
         select! {
@@ -34,11 +45,21 @@ pub async fn controller(config: Env, mut state: Snapshot) -> Result<()> {
             }, if scan_rx.is_some() => {
                 if let Some(value) = res {
                     let diff = diff_snapshots(&state, &value);
-                    println!("{diff:#?}");
+                    for event in diff {
+                        if let Err(err) = sink_tx.try_send(event) {
+                            match err {
+                                TrySendError::Full(_)=> {
+                                    eprintln!("controller: sink channel closed; stopping controller");
+                                },
+                                TrySendError::Closed(_)=> {
+                                    eprintln!("controller: sink channel full; dropping event");
+                                }
+                            }
+                        }
+                    }
                     state = value;
                 }
 
-                counter += 1;
                 scan_rx = None;
             }
         }
