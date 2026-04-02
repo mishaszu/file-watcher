@@ -1,11 +1,11 @@
 use std::{collections::HashMap, fs, path::PathBuf};
 
-use crate::{Result, State, model::Entity};
+use crate::{Result, Snapshot, model::Entity};
 
-pub fn read_dir(path: &PathBuf) -> Result<HashMap<PathBuf, Entity>> {
+pub fn parse_dir_blocking(path: &PathBuf) -> Result<HashMap<PathBuf, Entity>> {
     let mut content = fs::read_dir(path)?;
 
-    let mut state: State = HashMap::new();
+    let mut state: Snapshot = HashMap::new();
 
     // TODO: check why Option my occur and if it's not early termination
     while let Some(Ok(value)) = content.next() {
@@ -15,7 +15,7 @@ pub fn read_dir(path: &PathBuf) -> Result<HashMap<PathBuf, Entity>> {
         if let Some(value) = entry {
             let is_dir = value.is_dir();
             if is_dir {
-                let inner_state = read_dir(&path)?;
+                let inner_state = parse_dir_blocking(&path)?;
                 state.insert(path, value);
                 inner_state.into_iter().for_each(|(path, entity)| {
                     state.insert(path, entity);
