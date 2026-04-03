@@ -5,9 +5,10 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::{
-    controller::controller,
+    controller::{controller, queue_for_hash},
+    diff::diff_snapshots,
     hasher::{HasherIncomingMsg, HasherReadyMsg, hash_worker},
-    model::{FileEvent, Item},
+    model::{Item, SinkFileEvent},
     parser::parse_dir_blocking,
     sink::sink_watcher,
 };
@@ -16,6 +17,7 @@ mod controller;
 mod diff;
 mod env;
 mod hasher;
+mod helper;
 mod model;
 mod parser;
 mod sink;
@@ -35,7 +37,7 @@ async fn main() -> Result<()> {
     dotenv().ok();
     let (config, sink_kind) = env::Env::new();
 
-    let (file_evnt_tx, file_event_rx) = mpsc::channel::<FileEvent>(100);
+    let (file_event_tx, file_event_rx) = mpsc::channel::<SinkFileEvent>(100);
     let (hash_request_tx, hash_request_rx) = mpsc::channel::<HasherIncomingMsg>(100);
     let (hash_completion_tx, hash_completion_rx) = mpsc::channel::<HasherReadyMsg>(100);
 
@@ -50,11 +52,15 @@ async fn main() -> Result<()> {
     });
 
     let state = parse_dir_blocking(&config.root_dir)?;
+    {
+        let diff = diff_snapshots(&HashMap::new(), &state);
+        queue_for_hash(&diff, None, hash_request_tx.clone());
+    }
 
     controller(
         config,
         state,
-        file_evnt_tx,
+        file_event_tx,
         hash_request_tx,
         hash_completion_rx,
     )

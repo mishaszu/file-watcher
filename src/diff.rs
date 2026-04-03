@@ -1,68 +1,120 @@
 use crate::{
     Snapshot,
-    model::{EntityKind, FileEvent, ItemKind},
+    model::{EntityKind, Event, EventError, Item},
 };
 
-pub fn diff_snapshots(old: &Snapshot, new: &mut Snapshot) -> Vec<(u64, ItemKind, FileEvent)> {
+pub fn diff_snapshots(old: &Snapshot, new: &Snapshot) -> Vec<Event> {
     let mut events = Vec::new();
 
-    for (path, new_item) in new.iter_mut() {
+    for (path, new_item) in new.iter() {
         if let Some(old_item) = old.get(path) {
+            let new_version = old_item.version + 1;
             match (&new_item.kind, &old_item.kind) {
                 (EntityKind::File(new_file_metadata), EntityKind::File(old_file_metadata)) => {
-                    let new_version = old_item.version + 1;
                     if new_file_metadata.size != old_file_metadata.size {
-                        events.push((
-                            new_version,
-                            ItemKind::File,
-                            FileEvent::Update(path.to_owned()),
+                        // size changed, need to calculate new hash but doesn't need hash
+                        // comparison
+                        events.push(Event::Update(
+                            path.to_owned(),
+                            Item::new_file(
+                                new_version,
+                                new_file_metadata.name.clone(),
+                                new_file_metadata.mtime,
+                                new_file_metadata.size,
+                            ),
                         ));
-                        new_item.version = new_version;
                     } else if new_file_metadata.mtime != old_file_metadata.mtime {
                         match (
                             new_file_metadata.hash.as_ref(),
                             old_file_metadata.hash.as_ref(),
                         ) {
-                            (Some(new_hash), Some(old_hash)) if new_hash == old_hash => (),
-                            // Naive approach. With async hash calculating would need another
+                            (_, Some(_)) => {
+                                // if old hash was present new hash have to be generated to compare
+                                // for change
+                                let mut item = new_item.clone();
+
+                                if let EntityKind::File(metadata) = &mut item.kind {
+                                    metadata.hash = old_file_metadata.hash.clone();
+                                }
+
+                                events.push(Event::DirtyUpdate(path.to_owned(), item));
+                            }
+                            // Naive approach. Always update if no hash and mtime change.
+                            // With async hash calculating would need another
                             // approach to sync hashes before diff to make proper comparison
                             _ => {
-                                events.push((
-                                    new_version,
-                                    ItemKind::File,
-                                    FileEvent::Update(path.to_owned()),
+                                events.push(Event::Update(
+                                    path.to_owned(),
+                                    Item::new_file(
+                                        new_version,
+                                        new_file_metadata.name.clone(),
+                                        new_file_metadata.mtime,
+                                        new_file_metadata.size,
+                                    ),
                                 ));
-                                new_item.version = new_version;
                             }
                         }
                     }
                 }
-                (EntityKind::File(_), EntityKind::Dir(_)) => {
-                    events.push((0, ItemKind::Dir, FileEvent::Delete(path.to_owned())));
-                    events.push((0, ItemKind::File, FileEvent::Create(path.to_owned())));
+                (EntityKind::File(metadata), EntityKind::Dir(_)) => {
+                    events.push(Event::Delete(path.to_owned()));
+                    events.push(Event::Create(
+                        path.to_owned(),
+                        Item::new_file(0, metadata.name.clone(), metadata.mtime, metadata.size),
+                    ));
                 }
-                (EntityKind::Dir(_), EntityKind::File(_)) => {
-                    events.push((0, ItemKind::File, FileEvent::Delete(path.to_owned())));
-                    events.push((0, ItemKind::Dir, FileEvent::Create(path.to_owned())));
+                (EntityKind::Dir(metadata), EntityKind::File(_)) => {
+                    events.push(Event::Delete(path.to_owned()));
+                    events.push(Event::Create(
+                        path.to_owned(),
+                        Item::new_dir(0, metadata.name.clone()),
+                    ));
                 }
                 _ => (),
             }
         } else {
-            events.push((
-                0,
-                ItemKind::from(new_item),
-                FileEvent::Create(path.to_owned()),
-            ));
+            events.push(Event::Create(path.to_owned(), new_item.clone()));
         }
     }
 
-    for (path, item) in old.iter() {
+    for (path, _) in old.iter() {
         if !new.contains_key(path) {
-            events.push((0, ItemKind::from(item), FileEvent::Delete(path.to_owned())));
+            events.push(Event::Delete(path.to_owned()));
         }
     }
 
     events
+}
+
+pub fn apply_diff(snapshot: &mut Snapshot, diff: Vec<Event>) -> Vec<EventError> {
+    let mut res: Vec<EventError> = Vec::new();
+
+    for event in diff {
+        match event {
+            Event::Create(path, item) => {
+                let item_exist = snapshot.contains_key(&path);
+                if item_exist {
+                    res.push(EventError::Duplicate(path.to_string_lossy().into_owned()));
+                } else {
+                    snapshot.insert(path, item);
+                }
+            }
+            Event::Update(path, item) | Event::DirtyUpdate(path, item) => {
+                if let Some(old_item) = snapshot.get_mut(&path) {
+                    if old_item.version < item.version {
+                        *old_item = item;
+                    }
+                } else {
+                    res.push(EventError::NotFound(path.to_string_lossy().into_owned()));
+                }
+            }
+            Event::Delete(path) => {
+                snapshot.remove(&path);
+            }
+        }
+    }
+
+    res
 }
 
 #[cfg(test)]
@@ -72,35 +124,36 @@ mod tests {
     use crate::{
         Snapshot,
         diff::diff_snapshots,
-        model::{DirMetadata, EntityKind, FileEvent, FileMetadata, Item, ItemKind},
+        model::{EntityKind, Event, Item},
     };
 
     fn create_snapshot_1() -> Snapshot {
         let mut snapshot = HashMap::new();
 
+        let path = PathBuf::from_str("/test1.txt").unwrap();
         snapshot.insert(
-            PathBuf::from_str("/test1.txt").unwrap(),
-            Item::new_file("test1".to_string(), 10, 1000),
+            path.clone(),
+            Item::new_file(0, "test1".to_string(), 10, 1000),
         );
 
         snapshot.insert(
             PathBuf::from_str("/test").unwrap(),
-            Item::new_dir("test".to_string()),
+            Item::new_dir(0, "test".to_string()),
         );
 
         snapshot.insert(
             PathBuf::from_str("/test/test2.txt").unwrap(),
-            Item::new_file("test2".to_string(), 10, 1000),
+            Item::new_file(0, "test2".to_string(), 10, 1000),
         );
 
         snapshot.insert(
             PathBuf::from_str("/test/test3.txt").unwrap(),
-            Item::new_file("test3".to_string(), 10, 1000),
+            Item::new_file(0, "test3".to_string(), 10, 1000),
         );
 
         snapshot.insert(
             PathBuf::from_str("/test4.txt").unwrap(),
-            Item::new_file("test4".to_string(), 10, 1000),
+            Item::new_file(0, "test4".to_string(), 10, 1000),
         );
 
         snapshot
@@ -111,27 +164,27 @@ mod tests {
 
         snapshot.insert(
             PathBuf::from_str("/test1.txt").unwrap(),
-            Item::new_file("test1".to_string(), 10, 1000),
+            Item::new_file(0, "test1".to_string(), 10, 1000),
         );
 
         snapshot.insert(
             PathBuf::from_str("/test").unwrap(),
-            Item::new_dir("test".to_string()),
+            Item::new_dir(0, "test".to_string()),
         );
 
         snapshot.insert(
             PathBuf::from_str("/test/test2.txt").unwrap(),
-            Item::new_file("test2".to_string(), 11, 1030),
+            Item::new_file(0, "test2".to_string(), 11, 1030),
         );
 
         snapshot.insert(
             PathBuf::from_str("/test/test3.txt").unwrap(),
-            Item::new_file("test3".to_string(), 10, 1000),
+            Item::new_file(0, "test3".to_string(), 10, 1000),
         );
 
         snapshot.insert(
             PathBuf::from_str("/test5.txt").unwrap(),
-            Item::new_file("test5".to_string(), 10, 1000),
+            Item::new_file(0, "test5".to_string(), 10, 1000),
         );
 
         snapshot
@@ -140,27 +193,21 @@ mod tests {
     #[test]
     fn diff_snapshots_1() {
         let snapshot1 = create_snapshot_1();
-        let mut snapshot2 = create_snapshot_2();
+        let snapshot2 = create_snapshot_2();
 
-        let mut diff = diff_snapshots(&snapshot1, &mut snapshot2);
+        let mut diff = diff_snapshots(&snapshot1, &snapshot2);
 
         diff.sort();
 
         let mut expected = vec![
-            (
-                0,
-                ItemKind::File,
-                FileEvent::Create(PathBuf::from_str("/test5.txt").unwrap()),
+            Event::Create(
+                PathBuf::from_str("/test5.txt").unwrap(),
+                Item::new_file(0, "test5".to_string(), 10, 1000),
             ),
-            (
-                0,
-                ItemKind::File,
-                FileEvent::Delete(PathBuf::from_str("/test4.txt").unwrap()),
-            ),
-            (
-                0,
-                ItemKind::File,
-                FileEvent::Update(PathBuf::from_str("/test/test2.txt").unwrap()),
+            Event::Delete(PathBuf::from_str("/test4.txt").unwrap()),
+            Event::Update(
+                PathBuf::from_str("/test/test2.txt").unwrap(),
+                Item::new_file(1, "test2".to_string(), 11, 1030),
             ),
         ];
         expected.sort();
@@ -171,27 +218,21 @@ mod tests {
     #[test]
     fn diff_snapshots_2() {
         let snapshot1 = create_snapshot_2();
-        let mut snapshot2 = create_snapshot_1();
+        let snapshot2 = create_snapshot_1();
 
-        let mut diff = diff_snapshots(&snapshot1, &mut snapshot2);
+        let mut diff = diff_snapshots(&snapshot1, &snapshot2);
 
         diff.sort();
 
         let mut expected = vec![
-            (
-                0,
-                ItemKind::File,
-                FileEvent::Delete(PathBuf::from_str("/test5.txt").unwrap()),
+            Event::Delete(PathBuf::from_str("/test5.txt").unwrap()),
+            Event::Create(
+                PathBuf::from_str("/test4.txt").unwrap(),
+                Item::new_file(0, "test4".to_string(), 10, 1000),
             ),
-            (
-                0,
-                ItemKind::File,
-                FileEvent::Create(PathBuf::from_str("/test4.txt").unwrap()),
-            ),
-            (
-                0,
-                ItemKind::File,
-                FileEvent::Update(PathBuf::from_str("/test/test2.txt").unwrap()),
+            Event::Update(
+                PathBuf::from_str("/test/test2.txt").unwrap(),
+                Item::new_file(1, "test2".to_string(), 10, 1000),
             ),
         ];
         expected.sort();
@@ -204,30 +245,79 @@ mod tests {
         let mut snapshot1: Snapshot = HashMap::new();
         snapshot1.insert(
             PathBuf::from_str("/test").unwrap(),
-            Item::new_dir("test".to_string()),
+            Item::new_dir(0, "test".to_string()),
         );
         let mut snapshot2 = HashMap::new();
         snapshot2.insert(
             PathBuf::from_str("/test").unwrap(),
-            Item::new_file("text".to_string(), 100, 1000),
+            Item::new_file(0, "test".to_string(), 100, 1000),
         );
 
-        let mut diff = diff_snapshots(&snapshot1, &mut snapshot2);
+        let mut diff = diff_snapshots(&snapshot1, &snapshot2);
 
         diff.sort();
 
         let mut expected = vec![
-            (
-                0,
-                ItemKind::Dir,
-                FileEvent::Delete(PathBuf::from_str("/test").unwrap()),
-            ),
-            (
-                0,
-                ItemKind::File,
-                FileEvent::Create(PathBuf::from_str("/test").unwrap()),
+            Event::Delete(PathBuf::from_str("/test").unwrap()),
+            Event::Create(
+                PathBuf::from_str("/test").unwrap(),
+                Item::new_file(0, "test".to_string(), 100, 1000),
             ),
         ];
+        expected.sort();
+
+        assert_eq!(diff, expected);
+    }
+
+    #[test]
+    fn diff_update_after_mtime_change() {
+        let mut snapshot1 = HashMap::new();
+        snapshot1.insert(
+            PathBuf::from_str("/test.txt").unwrap(),
+            Item::new_file(0, "text".to_string(), 100, 1000),
+        );
+        let mut snapshot2 = HashMap::new();
+        snapshot2.insert(
+            PathBuf::from_str("/test.txt").unwrap(),
+            Item::new_file(0, "test".to_string(), 101, 1000),
+        );
+
+        let mut diff = diff_snapshots(&snapshot1, &snapshot2);
+
+        diff.sort();
+
+        let mut expected = vec![Event::Update(
+            PathBuf::from_str("/test.txt").unwrap(),
+            Item::new_file(1, "test".to_string(), 101, 1000),
+        )];
+        expected.sort();
+
+        assert_eq!(diff, expected);
+    }
+
+    #[test]
+    fn diff_no_update_after_mtime_change() {
+        let hash = "some_text_hash".to_string();
+
+        let mut snapshot1 = HashMap::new();
+        let mut file = Item::new_file(0, "text".to_string(), 100, 1000);
+        if let EntityKind::File(ref mut metadata) = file.kind {
+            metadata.hash = Some(hash.clone());
+        }
+        snapshot1.insert(PathBuf::from_str("/test.txt").unwrap(), file);
+
+        let mut snapshot2 = HashMap::new();
+        let mut file = Item::new_file(0, "text".to_string(), 100, 1000);
+        if let EntityKind::File(ref mut metadata) = file.kind {
+            metadata.hash = Some(hash.clone());
+        }
+        snapshot2.insert(PathBuf::from_str("/test.txt").unwrap(), file);
+
+        let mut diff = diff_snapshots(&snapshot1, &snapshot2);
+
+        diff.sort();
+
+        let mut expected = vec![];
         expected.sort();
 
         assert_eq!(diff, expected);

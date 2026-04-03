@@ -1,6 +1,6 @@
 use tokio::sync::mpsc;
 
-use crate::{model::FileEvent, sink::stdout_sink::StdoutSink};
+use crate::{model::SinkFileEvent, sink::stdout_sink::StdoutSink};
 
 pub mod stdout_sink;
 
@@ -10,10 +10,10 @@ pub enum SinkKind {
 }
 
 pub trait Sink {
-    async fn handle(&self, event: FileEvent);
+    async fn handle(&self, event: SinkFileEvent);
 }
 
-pub async fn sink_watcher(sink: impl Sink, mut rx: mpsc::Receiver<FileEvent>) {
+pub async fn sink_watcher(sink: impl Sink, mut rx: mpsc::Receiver<SinkFileEvent>) {
     while let Some(event) = rx.recv().await {
         sink.handle(event).await
     }

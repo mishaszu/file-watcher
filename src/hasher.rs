@@ -1,45 +1,34 @@
-use std::{cmp::max, collections::HashMap, io::Read, path::PathBuf, sync::Arc};
+use std::{cmp::max, io::Read, sync::Arc};
 
 use tokio::sync::{Semaphore, mpsc};
 
-pub struct HasherIncomingMsg(pub u64, pub PathBuf);
-pub struct HasherReadyMsg(pub u64, pub PathBuf, pub String);
+use crate::model::{HashCandidateInfo, HashedInfo};
+
+pub struct HasherIncomingMsg(pub HashCandidateInfo);
+pub struct HasherReadyMsg(pub HashedInfo);
 
 pub async fn hash_worker(
     mut files_to_hash_rx: mpsc::Receiver<HasherIncomingMsg>,
     complete_hash_tx: mpsc::Sender<HasherReadyMsg>,
 ) {
-    let mut state: HashMap<PathBuf, u64> = HashMap::new();
-
-    let max_workers = max(1, num_cpus::get() - 2);
+    let max_workers = max(1, num_cpus::get().saturating_sub(2));
 
     let semaphore = Arc::new(Semaphore::new(max_workers));
 
-    while let Some(HasherIncomingMsg(new_ver, path)) = files_to_hash_rx.recv().await {
-        if let Some(saved_ver) = state.get(&path)
-            && new_ver <= *saved_ver
-        {
-            // file with bigger version alread in process
-        } else {
-            state.insert(path.clone(), new_ver);
-            spawn_hash_job(
-                HasherIncomingMsg(new_ver, path),
-                semaphore.clone(),
-                complete_hash_tx.clone(),
-            )
-            .await;
-        }
+    while let Some(HasherIncomingMsg(info)) = files_to_hash_rx.recv().await {
+        spawn_hash_job(info, semaphore.clone(), complete_hash_tx.clone()).await;
     }
 }
 
 async fn spawn_hash_job(
-    HasherIncomingMsg(version, path): HasherIncomingMsg,
+    HashCandidateInfo { version, path }: HashCandidateInfo,
     semaphore: Arc<Semaphore>,
     complete_tx: mpsc::Sender<HasherReadyMsg>,
 ) {
     let permit = semaphore.acquire_owned().await.unwrap();
 
     tokio::spawn(async move {
+        println!("starting hash job");
         let send_path = path.clone();
 
         let result = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
@@ -60,8 +49,14 @@ async fn spawn_hash_job(
         })
         .await;
 
-        if let Ok(Ok(hash)) = result {
-            let _ = complete_tx.send(HasherReadyMsg(version, path, hash)).await;
+        if let Ok(Ok(new_hash)) = result {
+            let _ = complete_tx
+                .send(HasherReadyMsg(HashedInfo {
+                    version,
+                    path,
+                    new_hash,
+                }))
+                .await;
         }
 
         drop(permit);
