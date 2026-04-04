@@ -1,9 +1,9 @@
 use crate::{
     Snapshot,
-    model::{Event, EventError, Item, ItemKind},
+    model::{Event, EventError, Hash, Item, ItemKind},
 };
 
-pub fn diff_snapshots(old: &Snapshot, new: &Snapshot) -> Vec<Event> {
+pub fn diff_snapshots(old: &Snapshot, new: &Snapshot, next_job_id: &mut u64) -> Vec<Event> {
     let mut events = Vec::new();
 
     for (path, new_item) in new.iter() {
@@ -14,60 +14,51 @@ pub fn diff_snapshots(old: &Snapshot, new: &Snapshot) -> Vec<Event> {
                     if new_file_metadata.size != old_file_metadata.size {
                         // size changed, need to calculate new hash but doesn't need hash
                         // comparison
-                        events.push(Event::Update(
-                            path.to_owned(),
-                            Item::new_file(
-                                new_version,
-                                new_file_metadata.name.clone(),
-                                new_file_metadata.mtime,
-                                new_file_metadata.size,
-                            ),
-                        ));
+                        let item = Item::new_file_with_update_hash(
+                            new_version,
+                            new_file_metadata.name.clone(),
+                            new_file_metadata.mtime,
+                            new_file_metadata.size,
+                            next_job_id.to_owned(),
+                        );
+                        *next_job_id += 1;
+
+                        events.push(Event::Update(path.to_owned(), item));
                     } else if new_file_metadata.mtime != old_file_metadata.mtime {
-                        match (
-                            new_file_metadata.hash.as_ref(),
-                            old_file_metadata.hash.as_ref(),
-                        ) {
-                            (_, Some(_)) => {
-                                // if old hash was present new hash have to be generated to compare
-                                // for change
-                                let mut item = new_item.clone();
-                                item.version = new_version;
+                        let mut item = new_item.to_owned();
+                        item.version = new_version;
 
-                                if let ItemKind::File(metadata) = &mut item.kind {
-                                    metadata.hash = old_file_metadata.hash.clone();
-                                }
+                        let job_id = next_job_id.to_owned();
+                        *next_job_id += 1;
 
-                                events.push(Event::DirtyUpdate(path.to_owned(), item));
-                            }
+                        match &old_file_metadata.hash {
                             // Naive approach. Always update if no hash and mtime change.
                             // With async hash calculating would need another
                             // approach to sync hashes before diff to make proper comparison
-                            _ => {
-                                events.push(Event::Update(
-                                    path.to_owned(),
-                                    Item::new_file(
-                                        new_version,
-                                        new_file_metadata.name.clone(),
-                                        new_file_metadata.mtime,
-                                        new_file_metadata.size,
-                                    ),
-                                ));
+                            Hash::PendingNew(_) | Hash::None => {
+                                item.update_hash(Hash::PendingNew(job_id));
+                                events.push(Event::Update(path.to_owned(), item));
+                            }
+                            // if old hash was present new hash have to be generated to compare
+                            // for change
+                            Hash::Pending(old_hash, _) | Hash::Computed(old_hash) => {
+                                item.update_hash(Hash::Pending(old_hash.clone(), job_id));
+                                events.push(Event::DirtyUpdate(path.to_owned(), item));
                             }
                         }
                     }
                 }
                 (ItemKind::File(metadata), ItemKind::Dir(_)) => {
                     events.push(Event::Delete(path.to_owned()));
-                    events.push(Event::Create(
-                        path.to_owned(),
-                        Item::new_file(
-                            new_version,
-                            metadata.name.clone(),
-                            metadata.mtime,
-                            metadata.size,
-                        ),
-                    ));
+                    let item = Item::new_file_with_update_hash(
+                        new_version,
+                        metadata.name.clone(),
+                        metadata.mtime,
+                        metadata.size,
+                        next_job_id.to_owned(),
+                    );
+                    *next_job_id += 1;
+                    events.push(Event::Create(path.to_owned(), item));
                 }
                 (ItemKind::Dir(metadata), ItemKind::File(_)) => {
                     events.push(Event::Delete(path.to_owned()));
@@ -79,7 +70,17 @@ pub fn diff_snapshots(old: &Snapshot, new: &Snapshot) -> Vec<Event> {
                 _ => (),
             }
         } else {
-            events.push(Event::Create(path.to_owned(), new_item.clone()));
+            match new_item.kind {
+                ItemKind::Dir(_) => {
+                    events.push(Event::Create(path.to_owned(), new_item.clone()));
+                }
+                ItemKind::File(_) => {
+                    let mut item = new_item.clone();
+                    item.update_hash(Hash::PendingNew(next_job_id.to_owned()));
+                    *next_job_id += 1;
+                    events.push(Event::Create(path.to_owned(), item));
+                }
+            }
         }
     }
 
@@ -130,8 +131,58 @@ mod tests {
     use crate::{
         Snapshot,
         diff::{apply_diff, diff_snapshots},
-        model::{Event, Item, ItemKind},
+        model::{Event, Hash, Item, ItemKind},
     };
+
+    fn find_and_compare(events: &[Event], expect: &Event) {
+        let event = events
+            .iter()
+            .find(|&event| event.compare_path(expect.get_path()))
+            .unwrap();
+        match (event, expect) {
+            (Event::Create(_, item), Event::Create(_, expected))
+            | (Event::Update(_, item), Event::Update(_, expected))
+            | (Event::DirtyUpdate(_, item), Event::DirtyUpdate(_, expected)) => {
+                match (&item.kind, &expected.kind) {
+                    (ItemKind::File(item_medatada), ItemKind::File(expect_metadata)) => {
+                        assert_eq!(
+                            (
+                                &item_medatada.name,
+                                &item_medatada.mtime,
+                                &item_medatada.size
+                            ),
+                            (
+                                &expect_metadata.name,
+                                &expect_metadata.mtime,
+                                &expect_metadata.size
+                            ),
+                        );
+                        match (&item_medatada.hash, &expect_metadata.hash) {
+                            (Hash::None, Hash::None)
+                            | (Hash::PendingNew(_), Hash::PendingNew(_)) => (),
+                            (Hash::Pending(item_hash, _), Hash::Pending(expected_hash, _))
+                                if item_hash == expected_hash => {}
+                            (Hash::Computed(item_hash), Hash::Computed(expected_hash))
+                                if item_hash == expected_hash => {}
+                            _ => panic!(
+                                "Expected item doesn't match snapshot item hash. {:#?}: {:#?}",
+                                item_medatada, expect_metadata
+                            ),
+                        }
+                    }
+                    (ItemKind::Dir(item_medatada), ItemKind::Dir(expect_metadata)) => {
+                        assert_eq!(&item_medatada.name, &expect_metadata.name,);
+                    }
+                    _ => panic!(
+                        "Expected item doesn't match snapshot item kind. {:#?}: {:#?}",
+                        item, expected
+                    ),
+                }
+            }
+            (Event::Delete(_), Event::Delete(_)) => (),
+            _ => panic!("Expected event doesn't much snapshot event"),
+        }
+    }
 
     fn create_snapshot_1() -> Snapshot {
         let mut snapshot = HashMap::new();
@@ -201,24 +252,30 @@ mod tests {
         let snapshot1 = create_snapshot_1();
         let snapshot2 = create_snapshot_2();
 
-        let mut diff = diff_snapshots(&snapshot1, &snapshot2);
+        let mut next_job = 0;
 
-        diff.sort();
+        let diff = diff_snapshots(&snapshot1, &snapshot2, &mut next_job);
 
-        let mut expected = vec![
-            Event::Create(
+        find_and_compare(
+            &diff,
+            &Event::Create(
                 PathBuf::from_str("/test5.txt").unwrap(),
-                Item::new_file(0, "test5".to_string(), 10, 1000),
+                Item::new_file_with_update_hash(0, "test5".to_string(), 10, 1000, 0),
             ),
-            Event::Delete(PathBuf::from_str("/test4.txt").unwrap()),
-            Event::Update(
+        );
+        find_and_compare(
+            &diff,
+            &Event::Delete(PathBuf::from_str("/test4.txt").unwrap()),
+        );
+        find_and_compare(
+            &diff,
+            &Event::Update(
                 PathBuf::from_str("/test/test2.txt").unwrap(),
-                Item::new_file(1, "test2".to_string(), 11, 1030),
+                Item::new_file_with_update_hash(1, "test2".to_string(), 11, 1030, 0),
             ),
-        ];
-        expected.sort();
+        );
 
-        assert_eq!(diff, expected);
+        assert_eq!(next_job, 2);
     }
 
     #[test]
@@ -226,24 +283,32 @@ mod tests {
         let snapshot1 = create_snapshot_2();
         let snapshot2 = create_snapshot_1();
 
-        let mut diff = diff_snapshots(&snapshot1, &snapshot2);
+        let mut next_job = 0;
+
+        let mut diff = diff_snapshots(&snapshot1, &snapshot2, &mut next_job);
 
         diff.sort();
 
-        let mut expected = vec![
-            Event::Delete(PathBuf::from_str("/test5.txt").unwrap()),
-            Event::Create(
+        find_and_compare(
+            &diff,
+            &Event::Delete(PathBuf::from_str("/test5.txt").unwrap()),
+        );
+        find_and_compare(
+            &diff,
+            &Event::Create(
                 PathBuf::from_str("/test4.txt").unwrap(),
-                Item::new_file(0, "test4".to_string(), 10, 1000),
+                Item::new_file_with_update_hash(0, "test4".to_string(), 10, 1000, 0),
             ),
-            Event::Update(
+        );
+        find_and_compare(
+            &diff,
+            &Event::Update(
                 PathBuf::from_str("/test/test2.txt").unwrap(),
-                Item::new_file(1, "test2".to_string(), 10, 1000),
+                Item::new_file_with_update_hash(1, "test2".to_string(), 10, 1000, 0),
             ),
-        ];
-        expected.sort();
+        );
 
-        assert_eq!(diff, expected);
+        assert_eq!(next_job, 2);
     }
 
     #[test]
@@ -259,20 +324,21 @@ mod tests {
             Item::new_file(0, "test".to_string(), 100, 1000),
         );
 
-        let mut diff = diff_snapshots(&snapshot1, &snapshot2);
+        let mut next_job = 0;
+        let mut diff = diff_snapshots(&snapshot1, &snapshot2, &mut next_job);
 
-        diff.sort();
+        let (first, last) = diff.split_at_mut(1);
 
-        let mut expected = vec![
-            Event::Delete(PathBuf::from_str("/test").unwrap()),
-            Event::Create(
+        find_and_compare(first, &Event::Delete(PathBuf::from_str("/test").unwrap()));
+        find_and_compare(
+            last,
+            &Event::Create(
                 PathBuf::from_str("/test").unwrap(),
-                Item::new_file(0, "test".to_string(), 100, 1000),
+                Item::new_file_with_update_hash(0, "test".to_string(), 100, 1000, 0),
             ),
-        ];
-        expected.sort();
+        );
 
-        assert_eq!(diff, expected);
+        assert_eq!(next_job, 1);
     }
 
     #[test]
@@ -288,13 +354,14 @@ mod tests {
             Item::new_file(0, "test".to_string(), 101, 1000),
         );
 
-        let mut diff = diff_snapshots(&snapshot1, &snapshot2);
+        let mut next_job = 0;
+        let mut diff = diff_snapshots(&snapshot1, &snapshot2, &mut next_job);
 
         diff.sort();
 
         let mut expected = vec![Event::Update(
             PathBuf::from_str("/test.txt").unwrap(),
-            Item::new_file(1, "test".to_string(), 101, 1000),
+            Item::new_file_with_update_hash(1, "test".to_string(), 101, 1000, 0),
         )];
         expected.sort();
 
@@ -307,19 +374,17 @@ mod tests {
 
         let mut snapshot1 = HashMap::new();
         let mut file = Item::new_file(0, "text".to_string(), 100, 1000);
-        if let ItemKind::File(ref mut metadata) = file.kind {
-            metadata.hash = Some(hash.clone());
-        }
+        file.update_hash(Hash::Computed(hash.clone()));
         snapshot1.insert(PathBuf::from_str("/test.txt").unwrap(), file);
 
         let mut snapshot2 = HashMap::new();
         let mut file = Item::new_file(0, "text".to_string(), 100, 1000);
-        if let ItemKind::File(ref mut metadata) = file.kind {
-            metadata.hash = Some(hash.clone());
-        }
+        file.update_hash(Hash::Computed(hash.clone()));
         snapshot2.insert(PathBuf::from_str("/test.txt").unwrap(), file);
 
-        let mut diff = diff_snapshots(&snapshot1, &snapshot2);
+        let mut next_job = 0;
+
+        let mut diff = diff_snapshots(&snapshot1, &snapshot2, &mut next_job);
 
         diff.sort();
 
@@ -335,23 +400,20 @@ mod tests {
 
         let mut snapshot1 = HashMap::new();
         let mut file = Item::new_file(0, "test".to_string(), 100, 1000);
-        if let ItemKind::File(ref mut metadata) = file.kind {
-            metadata.hash = Some(hash.clone());
-        }
+        file.update_hash(Hash::Computed(hash.clone()));
         snapshot1.insert(PathBuf::from_str("/test.txt").unwrap(), file);
 
         let mut snapshot2 = HashMap::new();
         let file = Item::new_file(0, "test".to_string(), 101, 1000);
         snapshot2.insert(PathBuf::from_str("/test.txt").unwrap(), file);
 
-        let mut diff = diff_snapshots(&snapshot1, &snapshot2);
+        let mut job_id = 0;
+        let mut diff = diff_snapshots(&snapshot1, &snapshot2, &mut job_id);
 
         diff.sort();
 
         let mut item = Item::new_file(1, "test".to_string(), 101, 1000);
-        if let ItemKind::File(metadata) = &mut item.kind {
-            metadata.hash = Some(hash.clone());
-        }
+        item.update_hash(Hash::Pending(hash.clone(), 0));
 
         let mut expected = vec![Event::DirtyUpdate(
             PathBuf::from_str("/test.txt").unwrap(),
@@ -365,11 +427,10 @@ mod tests {
 
         let mut expected = HashMap::new();
         let mut file = Item::new_file(1, "test".to_string(), 101, 1000);
-        if let ItemKind::File(ref mut metadata) = file.kind {
-            metadata.hash = Some(hash.clone());
-        }
+        file.update_hash(Hash::Pending(hash.clone(), 0));
         expected.insert(PathBuf::from_str("/test.txt").unwrap(), file);
 
         assert_eq!(snapshot1, expected);
+        assert_eq!(job_id, 1);
     }
 }

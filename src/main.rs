@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use dotenv::dotenv;
 use thiserror::Error;
@@ -47,9 +47,10 @@ async fn main() -> Result<()> {
     let (hash_completion_tx, hash_completion_rx) = mpsc::channel::<HasherReadyMsg>(100);
 
     tokio::spawn(async {
-        hash_worker(hash_request_rx, hash_completion_tx)
-            .await
-            .unwrap();
+        if let Err(err) = hash_worker(hash_request_rx, hash_completion_tx).await {
+            // TODO: it should trigger shotdown
+            eprintln!("hash worker failed: {err}");
+        }
     });
 
     tokio::spawn(async {
@@ -58,17 +59,25 @@ async fn main() -> Result<()> {
         }
     });
 
+    let mut next_job_id = 0;
     println!("FileWatcher: building root directory snapshot");
     let state = parse_dir_blocking(&config.root_dir)?;
-    {
-        let diff = diff_snapshots(&HashMap::new(), &state);
-        queue_for_hash(&diff, None, hash_request_tx.clone())?;
-    }
+    let diff = diff_snapshots(&HashMap::new(), &state, &mut next_job_id);
+
+    let hash_request_tx2 = hash_request_tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Err(err) = queue_for_hash(&diff, None, hash_request_tx2) {
+            // TODO: it should trigger shotdown
+            eprintln!("FileWatcher: failed to queue initial hash requests: {err}");
+        }
+    });
 
     println!("FileWatcher: starting watcher");
     controller(
         config,
         state,
+        next_job_id,
         file_event_tx,
         hash_request_tx,
         hash_completion_rx,

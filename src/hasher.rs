@@ -6,13 +6,13 @@ use crate::{Error, Result};
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone)]
 pub struct HashCandidateInfo {
-    pub version: u64,
+    pub job_id: u64,
     pub path: PathBuf,
 }
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone)]
 pub struct HashedInfo {
-    pub version: u64,
+    pub job_id: u64,
     pub path: PathBuf,
     pub new_hash: String,
 }
@@ -36,7 +36,7 @@ pub async fn hash_worker(
 }
 
 async fn spawn_hash_job(
-    HashCandidateInfo { version, path }: HashCandidateInfo,
+    HashCandidateInfo { job_id, path }: HashCandidateInfo,
     semaphore: Arc<Semaphore>,
     complete_tx: mpsc::Sender<HasherReadyMsg>,
 ) -> Result<()> {
@@ -66,19 +66,29 @@ async fn spawn_hash_job(
         })
         .await;
 
-        if let Ok(Ok(new_hash)) = result {
-            // result could be used exmaple in error sink
-            if let Err(err) = complete_tx
-                .send(HasherReadyMsg(HashedInfo {
-                    version,
-                    path,
-                    new_hash,
-                }))
-                .await
-            {
+        match result {
+            Ok(Ok(new_hash)) => {
+                if let Err(err) = complete_tx
+                    .send(HasherReadyMsg(HashedInfo {
+                        job_id,
+                        path,
+                        new_hash,
+                    }))
+                    .await
+                {
+                    eprintln!(
+                        "failed to send hash completion for path {:?} job_id {}: {}",
+                        err.0.0.path, err.0.0.job_id, err
+                    );
+                }
+            }
+            Ok(Err(err)) => {
+                eprintln!("failed to hash path {:?} job_id {}: {}", path, job_id, err);
+            }
+            Err(err) => {
                 eprintln!(
-                    "failed to send hash completion for path {:?} version {}: {}",
-                    err.0.0.path, err.0.0.version, err
+                    "hash task failed for path {:?} job_id {}: {}",
+                    path, job_id, err
                 );
             }
         }

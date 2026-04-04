@@ -3,15 +3,15 @@ use std::{collections::HashMap, fs, path::PathBuf};
 use crate::{Result, Snapshot, model::Item};
 
 pub fn parse_dir_blocking(path: &PathBuf) -> Result<Snapshot> {
-    let mut content = fs::read_dir(path)?;
+    let content = fs::read_dir(path)?;
 
     let mut state: Snapshot = HashMap::new();
 
-    // TODO: check why Option my occur and if it's not early termination
-    while let Some(Ok(value)) = content.next() {
-        let path = value.path();
+    for item in content {
+        let item = item?;
+        let path = item.path();
 
-        let entry = Item::try_from_direntry(value)?;
+        let entry = Item::try_from_direntry(item)?;
         if let Some(value) = entry {
             let is_dir = value.kind.is_dir();
             if is_dir {
@@ -25,5 +25,6 @@ pub fn parse_dir_blocking(path: &PathBuf) -> Result<Snapshot> {
             }
         }
     }
+
     Ok(state)
 }
