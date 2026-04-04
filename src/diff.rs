@@ -32,6 +32,7 @@ pub fn diff_snapshots(old: &Snapshot, new: &Snapshot) -> Vec<Event> {
                                 // if old hash was present new hash have to be generated to compare
                                 // for change
                                 let mut item = new_item.clone();
+                                item.version = new_version;
 
                                 if let EntityKind::File(metadata) = &mut item.kind {
                                     metadata.hash = old_file_metadata.hash.clone();
@@ -123,7 +124,7 @@ mod tests {
 
     use crate::{
         Snapshot,
-        diff::diff_snapshots,
+        diff::{apply_diff, diff_snapshots},
         model::{EntityKind, Event, Item},
     };
 
@@ -321,5 +322,49 @@ mod tests {
         expected.sort();
 
         assert_eq!(diff, expected);
+    }
+
+    #[test]
+    fn after_diff_and_apply_state_should_still_have_hash() {
+        let hash = "some_text_hash".to_string();
+
+        let mut snapshot1 = HashMap::new();
+        let mut file = Item::new_file(0, "test".to_string(), 100, 1000);
+        if let EntityKind::File(ref mut metadata) = file.kind {
+            metadata.hash = Some(hash.clone());
+        }
+        snapshot1.insert(PathBuf::from_str("/test.txt").unwrap(), file);
+
+        let mut snapshot2 = HashMap::new();
+        let file = Item::new_file(0, "test".to_string(), 101, 1000);
+        snapshot2.insert(PathBuf::from_str("/test.txt").unwrap(), file);
+
+        let mut diff = diff_snapshots(&snapshot1, &snapshot2);
+
+        diff.sort();
+
+        let mut item = Item::new_file(1, "test".to_string(), 101, 1000);
+        if let EntityKind::File(metadata) = &mut item.kind {
+            metadata.hash = Some(hash.clone());
+        }
+
+        let mut expected = vec![Event::DirtyUpdate(
+            PathBuf::from_str("/test.txt").unwrap(),
+            item,
+        )];
+        expected.sort();
+
+        assert_eq!(diff, expected);
+
+        apply_diff(&mut snapshot1, diff);
+
+        let mut expected = HashMap::new();
+        let mut file = Item::new_file(1, "test".to_string(), 101, 1000);
+        if let EntityKind::File(ref mut metadata) = file.kind {
+            metadata.hash = Some(hash.clone());
+        }
+        expected.insert(PathBuf::from_str("/test.txt").unwrap(), file);
+
+        assert_eq!(snapshot1, expected);
     }
 }
