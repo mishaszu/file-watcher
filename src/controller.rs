@@ -10,10 +10,10 @@ use crate::{
     Result, Snapshot,
     diff::{apply_diff, diff_snapshots},
     env::Env,
-    hasher::{HasherIncomingMsg, HasherReadyMsg},
-    helper::eprint_try_send_error,
-    model::{EntityKind, Event, HashCandidateInfo, HashedInfo, SinkFileEvent},
+    hasher::{HashCandidateInfo, HashedInfo, HasherIncomingMsg, HasherReadyMsg},
+    model::{Event, ItemKind, try_send_to_channel},
     parser::parse_dir_blocking,
+    sink::SinkFileEvent,
 };
 
 pub async fn controller(
@@ -43,18 +43,14 @@ pub async fn controller(
                 }
             }
             Some(HasherReadyMsg(HashedInfo{path, version, new_hash})) = hash_completion_rx.recv() => {
-                println!("hash version incoming: {version}");
                 if let Some(item) =  state.get_mut(&path) && item.version == version
-                    && let EntityKind::File(metadata) = &mut item.kind {
-
+                    && let ItemKind::File(metadata) = &mut item.kind {
                         match metadata.hash.as_ref() {
                             Some(old_hash) => {
                                 let changed = old_hash != &new_hash;
                                 if changed {
                                     metadata.hash = Some(new_hash);
-                                    if let Err(err) = sink_tx.try_send(SinkFileEvent::Update(path.clone())) {
-                                        eprint_try_send_error(err);
-                                    }
+                                    try_send_to_channel("Sink", sink_tx.try_send(SinkFileEvent::Update(path.clone())))?;
 
                                 }
                             },
@@ -62,9 +58,6 @@ pub async fn controller(
                                 metadata.hash = Some(new_hash);
                             },
                         }
-                        //
-                        // println!("hash changed: {}, old : {:#?}", changed, metadata.hash);
-
                     }
             }
             res = async {
@@ -75,7 +68,7 @@ pub async fn controller(
             }, if scan_rx.is_some() => {
                 if let Some(new_snapshot) = res {
                     let diff = diff_snapshots(&state, &new_snapshot);
-                    queue_for_hash(&diff, Some(sink_tx.clone()), hash_request_tx.clone());
+                    queue_for_hash(&diff, Some(sink_tx.clone()), hash_request_tx.clone())?;
                     let _result = apply_diff(&mut state, diff);
                 }
 
@@ -89,15 +82,14 @@ pub fn queue_for_hash(
     diff: &[Event],
     sink_tx: Option<mpsc::Sender<SinkFileEvent>>,
     hash_request_tx: mpsc::Sender<HasherIncomingMsg>,
-) {
+) -> Result<()> {
     for event in diff {
         let sink_event: Option<SinkFileEvent> = event.try_into().ok();
 
         if let Some(sink_event) = sink_event
             && let Some(ref sink_tx) = sink_tx
-            && let Err(err) = sink_tx.try_send(sink_event)
         {
-            eprint_try_send_error(err);
+            try_send_to_channel("Sink", sink_tx.try_send(sink_event))?;
         }
 
         match event {
@@ -109,12 +101,14 @@ pub fn queue_for_hash(
                         version: item.version,
                         path: path.clone(),
                     };
-                    if let Err(err) = hash_request_tx.try_send(HasherIncomingMsg(info)) {
-                        eprint_try_send_error(err);
-                    }
+                    try_send_to_channel(
+                        "Hasher",
+                        hash_request_tx.try_send(HasherIncomingMsg(info)),
+                    )?;
                 }
             }
             _ => (),
         }
     }
+    Ok(())
 }

@@ -5,6 +5,7 @@ use std::{
 };
 
 use thiserror::Error;
+use tokio::sync::mpsc::error::TrySendError;
 
 use crate::Result;
 
@@ -27,14 +28,14 @@ pub struct DirMetadata {
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone)]
 pub struct Item {
     pub version: u64,
-    pub kind: EntityKind,
+    pub kind: ItemKind,
 }
 
 impl Item {
     pub fn new_file(version: u64, name: String, mtime: i64, size: u64) -> Self {
         Self {
             version,
-            kind: EntityKind::File(FileMetadata {
+            kind: ItemKind::File(FileMetadata {
                 name,
                 mtime,
                 size,
@@ -46,7 +47,7 @@ impl Item {
     pub fn new_dir(version: u64, name: String) -> Self {
         Self {
             version,
-            kind: EntityKind::Dir(DirMetadata { name }),
+            kind: ItemKind::Dir(DirMetadata { name }),
         }
     }
 
@@ -73,12 +74,12 @@ impl Item {
 }
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone)]
-pub enum EntityKind {
+pub enum ItemKind {
     File(FileMetadata),
     Dir(DirMetadata),
 }
 
-impl EntityKind {
+impl ItemKind {
     pub fn is_file(&self) -> bool {
         matches!(self, Self::File(_))
     }
@@ -87,22 +88,7 @@ impl EntityKind {
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone)]
-pub struct HashCandidateInfo {
-    pub version: u64,
-    pub path: PathBuf,
-}
-
-#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone)]
-pub struct HashedInfo {
-    pub version: u64,
-    pub path: PathBuf,
-    pub new_hash: String,
-}
-
-pub type EventResult<T> = std::result::Result<T, EventError>;
-
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum EventError {
     #[error("Item already exists {0}")]
     Duplicate(String),
@@ -118,25 +104,18 @@ pub enum Event {
     DirtyUpdate(PathBuf, Item),
     Delete(PathBuf),
 }
-
-#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone)]
-pub enum SinkFileEvent {
-    Create(PathBuf),
-    Update(PathBuf),
-    Delete(PathBuf),
-}
-
-impl TryFrom<&Event> for SinkFileEvent {
-    type Error = Box<dyn std::error::Error>;
-
-    fn try_from(ev: &Event) -> std::result::Result<Self, Self::Error> {
-        match ev {
-            Event::Create(path, _) => Ok(Self::Create(path.to_owned())),
-            Event::Update(path, _) => Ok(Self::Update(path.to_owned())),
-            Event::DirtyUpdate(_, _) => {
-                Err(std::io::Error::other("Dirty update can't be converted to sink update").into())
-            }
-            Event::Delete(path) => Ok(Self::Delete(path.to_owned())),
+pub fn try_send_to_channel<T>(
+    queue_name: &str,
+    res: std::result::Result<(), TrySendError<T>>,
+) -> std::result::Result<(), crate::Error> {
+    match res {
+        Err(TrySendError::Full(_)) => {
+            eprintln!("{queue_name} channel full; dropping event");
+            Ok(())
         }
+        Err(TrySendError::Closed(_)) => Err(crate::Error::QueueClosed(format!(
+            "{queue_name} channel closed; stopping controller"
+        ))),
+        Ok(_) => Ok(()),
     }
 }

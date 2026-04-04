@@ -1,4 +1,4 @@
-use crate::{model::SinkFileEvent, sink::Sink};
+use crate::sink::{Sink, SinkFileEvent};
 
 #[derive(Clone, Debug)]
 pub struct StdoutSink;

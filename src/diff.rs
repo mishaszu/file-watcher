@@ -1,6 +1,6 @@
 use crate::{
     Snapshot,
-    model::{EntityKind, Event, EventError, Item},
+    model::{Event, EventError, Item, ItemKind},
 };
 
 pub fn diff_snapshots(old: &Snapshot, new: &Snapshot) -> Vec<Event> {
@@ -10,7 +10,7 @@ pub fn diff_snapshots(old: &Snapshot, new: &Snapshot) -> Vec<Event> {
         if let Some(old_item) = old.get(path) {
             let new_version = old_item.version + 1;
             match (&new_item.kind, &old_item.kind) {
-                (EntityKind::File(new_file_metadata), EntityKind::File(old_file_metadata)) => {
+                (ItemKind::File(new_file_metadata), ItemKind::File(old_file_metadata)) => {
                     if new_file_metadata.size != old_file_metadata.size {
                         // size changed, need to calculate new hash but doesn't need hash
                         // comparison
@@ -34,7 +34,7 @@ pub fn diff_snapshots(old: &Snapshot, new: &Snapshot) -> Vec<Event> {
                                 let mut item = new_item.clone();
                                 item.version = new_version;
 
-                                if let EntityKind::File(metadata) = &mut item.kind {
+                                if let ItemKind::File(metadata) = &mut item.kind {
                                     metadata.hash = old_file_metadata.hash.clone();
                                 }
 
@@ -57,18 +57,23 @@ pub fn diff_snapshots(old: &Snapshot, new: &Snapshot) -> Vec<Event> {
                         }
                     }
                 }
-                (EntityKind::File(metadata), EntityKind::Dir(_)) => {
+                (ItemKind::File(metadata), ItemKind::Dir(_)) => {
                     events.push(Event::Delete(path.to_owned()));
                     events.push(Event::Create(
                         path.to_owned(),
-                        Item::new_file(0, metadata.name.clone(), metadata.mtime, metadata.size),
+                        Item::new_file(
+                            new_version,
+                            metadata.name.clone(),
+                            metadata.mtime,
+                            metadata.size,
+                        ),
                     ));
                 }
-                (EntityKind::Dir(metadata), EntityKind::File(_)) => {
+                (ItemKind::Dir(metadata), ItemKind::File(_)) => {
                     events.push(Event::Delete(path.to_owned()));
                     events.push(Event::Create(
                         path.to_owned(),
-                        Item::new_dir(0, metadata.name.clone()),
+                        Item::new_dir(new_version, metadata.name.clone()),
                     ));
                 }
                 _ => (),
@@ -125,7 +130,7 @@ mod tests {
     use crate::{
         Snapshot,
         diff::{apply_diff, diff_snapshots},
-        model::{EntityKind, Event, Item},
+        model::{Event, Item, ItemKind},
     };
 
     fn create_snapshot_1() -> Snapshot {
@@ -302,14 +307,14 @@ mod tests {
 
         let mut snapshot1 = HashMap::new();
         let mut file = Item::new_file(0, "text".to_string(), 100, 1000);
-        if let EntityKind::File(ref mut metadata) = file.kind {
+        if let ItemKind::File(ref mut metadata) = file.kind {
             metadata.hash = Some(hash.clone());
         }
         snapshot1.insert(PathBuf::from_str("/test.txt").unwrap(), file);
 
         let mut snapshot2 = HashMap::new();
         let mut file = Item::new_file(0, "text".to_string(), 100, 1000);
-        if let EntityKind::File(ref mut metadata) = file.kind {
+        if let ItemKind::File(ref mut metadata) = file.kind {
             metadata.hash = Some(hash.clone());
         }
         snapshot2.insert(PathBuf::from_str("/test.txt").unwrap(), file);
@@ -330,7 +335,7 @@ mod tests {
 
         let mut snapshot1 = HashMap::new();
         let mut file = Item::new_file(0, "test".to_string(), 100, 1000);
-        if let EntityKind::File(ref mut metadata) = file.kind {
+        if let ItemKind::File(ref mut metadata) = file.kind {
             metadata.hash = Some(hash.clone());
         }
         snapshot1.insert(PathBuf::from_str("/test.txt").unwrap(), file);
@@ -344,7 +349,7 @@ mod tests {
         diff.sort();
 
         let mut item = Item::new_file(1, "test".to_string(), 101, 1000);
-        if let EntityKind::File(metadata) = &mut item.kind {
+        if let ItemKind::File(metadata) = &mut item.kind {
             metadata.hash = Some(hash.clone());
         }
 
@@ -360,7 +365,7 @@ mod tests {
 
         let mut expected = HashMap::new();
         let mut file = Item::new_file(1, "test".to_string(), 101, 1000);
-        if let EntityKind::File(ref mut metadata) = file.kind {
+        if let ItemKind::File(ref mut metadata) = file.kind {
             metadata.hash = Some(hash.clone());
         }
         expected.insert(PathBuf::from_str("/test.txt").unwrap(), file);

@@ -8,16 +8,15 @@ use crate::{
     controller::{controller, queue_for_hash},
     diff::diff_snapshots,
     hasher::{HasherIncomingMsg, HasherReadyMsg, hash_worker},
-    model::{Item, SinkFileEvent},
+    model::Item,
     parser::parse_dir_blocking,
-    sink::sink_watcher,
+    sink::{SinkFileEvent, sink_watcher},
 };
 
 mod controller;
 mod diff;
 mod env;
 mod hasher;
-mod helper;
 mod model;
 mod parser;
 mod sink;
@@ -26,6 +25,12 @@ mod sink;
 pub enum Error {
     #[error("io error {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("queue channel was closed: {0}")]
+    QueueClosed(String),
+
+    #[error("semaphore was closed, can't issue new permits")]
+    SemaphoreClosed,
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -42,7 +47,9 @@ async fn main() -> Result<()> {
     let (hash_completion_tx, hash_completion_rx) = mpsc::channel::<HasherReadyMsg>(100);
 
     tokio::spawn(async {
-        hash_worker(hash_request_rx, hash_completion_tx).await;
+        hash_worker(hash_request_rx, hash_completion_tx)
+            .await
+            .unwrap();
     });
 
     tokio::spawn(async {
@@ -51,12 +58,14 @@ async fn main() -> Result<()> {
         }
     });
 
+    println!("FileWatcher: building root directory snapshot");
     let state = parse_dir_blocking(&config.root_dir)?;
     {
         let diff = diff_snapshots(&HashMap::new(), &state);
-        queue_for_hash(&diff, None, hash_request_tx.clone());
+        queue_for_hash(&diff, None, hash_request_tx.clone())?;
     }
 
+    println!("FileWatcher: starting watcher");
     controller(
         config,
         state,
