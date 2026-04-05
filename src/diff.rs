@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crate::{
     Snapshot,
     model::{Event, EventError, Hash, Item, ItemKind},
@@ -9,66 +11,12 @@ pub fn diff_snapshots(old: &Snapshot, new: &Snapshot, next_job_id: &mut u64) -> 
     for (path, new_item) in new.iter() {
         if let Some(old_item) = old.get(path) {
             let new_version = old_item.version + 1;
-            match (&new_item.kind, &old_item.kind) {
-                (ItemKind::File(new_file_metadata), ItemKind::File(old_file_metadata)) => {
-                    if new_file_metadata.size != old_file_metadata.size {
-                        // size changed, need to calculate new hash but doesn't need hash
-                        // comparison
-                        let item = Item::new_file_with_update_hash(
-                            new_version,
-                            new_file_metadata.name.clone(),
-                            new_file_metadata.mtime,
-                            new_file_metadata.size,
-                            next_job_id.to_owned(),
-                        );
-                        *next_job_id += 1;
-
-                        events.push(Event::Update(path.to_owned(), item));
-                    } else if new_file_metadata.mtime != old_file_metadata.mtime {
-                        let mut item = new_item.to_owned();
-                        item.version = new_version;
-
-                        let job_id = next_job_id.to_owned();
-                        *next_job_id += 1;
-
-                        match &old_file_metadata.hash {
-                            // Naive approach. Always update if no hash and mtime change.
-                            // With async hash calculating would need another
-                            // approach to sync hashes before diff to make proper comparison
-                            Hash::PendingNew(_) | Hash::None => {
-                                item.update_hash(Hash::PendingNew(job_id));
-                                events.push(Event::Update(path.to_owned(), item));
-                            }
-                            // if old hash was present new hash have to be generated to compare
-                            // for change
-                            Hash::Pending(old_hash, _) | Hash::Computed(old_hash) => {
-                                item.update_hash(Hash::Pending(old_hash.clone(), job_id));
-                                events.push(Event::DirtyUpdate(path.to_owned(), item));
-                            }
-                        }
-                    }
-                }
-                (ItemKind::File(metadata), ItemKind::Dir(_)) => {
-                    events.push(Event::Delete(path.to_owned()));
-                    let item = Item::new_file_with_update_hash(
-                        new_version,
-                        metadata.name.clone(),
-                        metadata.mtime,
-                        metadata.size,
-                        next_job_id.to_owned(),
-                    );
-                    *next_job_id += 1;
-                    events.push(Event::Create(path.to_owned(), item));
-                }
-                (ItemKind::Dir(metadata), ItemKind::File(_)) => {
-                    events.push(Event::Delete(path.to_owned()));
-                    events.push(Event::Create(
-                        path.to_owned(),
-                        Item::new_dir(new_version, metadata.name.clone()),
-                    ));
-                }
-                _ => (),
-            }
+            let comparison_events: Vec<Event> =
+                compare_items(path, old_item, new_item, new_version, next_job_id)
+                    .into_iter()
+                    .flatten()
+                    .collect();
+            events.extend_from_slice(&comparison_events);
         } else {
             match new_item.kind {
                 ItemKind::Dir(_) => {
@@ -91,6 +39,113 @@ pub fn diff_snapshots(old: &Snapshot, new: &Snapshot, next_job_id: &mut u64) -> 
     }
 
     events
+}
+
+pub fn compare_items(
+    path: &PathBuf,
+    old_item: &Item,
+    new_item: &Item,
+    new_version: u64,
+    next_job_id: &mut u64,
+) -> Option<Vec<Event>> {
+    match (&new_item.kind, &old_item.kind) {
+        (ItemKind::File(new_file_metadata), ItemKind::File(old_file_metadata)) => {
+            if new_file_metadata.size != old_file_metadata.size {
+                // size changed, need to calculate new hash but doesn't need hash
+                // comparison
+                let item = Item::new_file_with_update_hash(
+                    new_version,
+                    new_file_metadata.name.clone(),
+                    new_file_metadata.mtime,
+                    new_file_metadata.size,
+                    next_job_id.to_owned(),
+                );
+                *next_job_id += 1;
+
+                Some(Vec::from([Event::Update(path.to_owned(), item)]))
+            } else if new_file_metadata.mtime != old_file_metadata.mtime {
+                let mut item = new_item.to_owned();
+                item.version = new_version;
+
+                let job_id = next_job_id.to_owned();
+                *next_job_id += 1;
+
+                match &old_file_metadata.hash {
+                    // Naive approach. Always update if no hash and mtime change.
+                    // With async hash calculating would need another
+                    // approach to sync hashes before diff to make proper comparison
+                    Hash::PendingNew(_) | Hash::None => {
+                        item.update_hash(Hash::PendingNew(job_id));
+                        Some(Vec::from([Event::Update(path.to_owned(), item)]))
+                    }
+                    // if old hash was present new hash have to be generated to compare
+                    // for change
+                    Hash::Pending(old_hash, _) | Hash::Computed(old_hash) => {
+                        item.update_hash(Hash::Pending(old_hash.clone(), job_id));
+                        Some(Vec::from([Event::DirtyUpdate(path.to_owned(), item)]))
+                    }
+                }
+            } else {
+                None
+            }
+        }
+        (ItemKind::File(metadata), ItemKind::Dir(_)) => {
+            let ev1 = Event::Delete(path.to_owned());
+            let item = Item::new_file_with_update_hash(
+                new_version,
+                metadata.name.clone(),
+                metadata.mtime,
+                metadata.size,
+                next_job_id.to_owned(),
+            );
+            *next_job_id += 1;
+            let ev2 = Event::Create(path.to_owned(), item);
+            Some(Vec::from([ev1, ev2]))
+        }
+        (ItemKind::Dir(metadata), ItemKind::File(_)) => {
+            let ev1 = Event::Delete(path.to_owned());
+            let ev2 = Event::Create(
+                path.to_owned(),
+                Item::new_dir(new_version, metadata.name.clone()),
+            );
+
+            Some(Vec::from([ev1, ev2]))
+        }
+        _ => None,
+    }
+}
+
+pub fn find_n_diff_item(
+    old: &Snapshot,
+    new_item: (PathBuf, ItemKind),
+    next_job_id: &mut u64,
+) -> Vec<Event> {
+    if let Some(old_item) = old.get(&new_item.0) {
+        let new_version = old_item.version + 1;
+        compare_items(
+            &new_item.0,
+            old_item,
+            &Item {
+                version: 0,
+                kind: new_item.1,
+            },
+            new_version,
+            next_job_id,
+        )
+        .into_iter()
+        .flatten()
+        .collect()
+    } else {
+        let mut kind = new_item.1;
+        match &mut kind {
+            ItemKind::File(file_metadata) => {
+                file_metadata.hash = Hash::PendingNew(next_job_id.to_owned());
+            }
+            ItemKind::Dir(_) => (),
+        };
+        *next_job_id += 1;
+        Vec::from([Event::Create(new_item.0, Item { version: 0, kind })])
+    }
 }
 
 pub fn apply_diff(snapshot: &mut Snapshot, diff: Vec<Event>) -> Vec<EventError> {
@@ -130,7 +185,7 @@ mod tests {
 
     use crate::{
         Snapshot,
-        diff::{apply_diff, diff_snapshots},
+        diff::{apply_diff, diff_snapshots, find_n_diff_item},
         model::{Event, Hash, Item, ItemKind},
     };
 
@@ -432,5 +487,104 @@ mod tests {
 
         assert_eq!(snapshot1, expected);
         assert_eq!(job_id, 1);
+    }
+
+    fn file_kind_with_mtime(mtime: i64) -> ItemKind {
+        let mut kind = ItemKind::File(Default::default());
+        if let ItemKind::File(file_metadata) = &mut kind {
+            file_metadata.mtime = mtime;
+        }
+        kind
+    }
+
+    fn dir_kind() -> ItemKind {
+        ItemKind::Dir(Default::default())
+    }
+
+    fn item(version: u64, kind: ItemKind) -> Item {
+        Item { version, kind }
+    }
+
+    #[test]
+    fn find_n_diff_item_creates_new_file_with_pending_new_hash() {
+        let old = Snapshot::default();
+        let path = PathBuf::from("new-file.txt");
+        let mut next_job_id = 41;
+
+        let events = find_n_diff_item(
+            &old,
+            (path.clone(), file_kind_with_mtime(10)),
+            &mut next_job_id,
+        );
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::Create(event_path, created_item) => {
+                assert_eq!(event_path, &path);
+                match &created_item.kind {
+                    ItemKind::File(file_metadata) => {
+                        assert!(matches!(file_metadata.hash, Hash::PendingNew(41)));
+                    }
+                    ItemKind::Dir(_) => panic!("expected file create event"),
+                }
+            }
+            other => panic!("expected create event, got {other:?}"),
+        }
+        assert_eq!(next_job_id, 42);
+    }
+
+    #[test]
+    fn find_n_diff_item_marks_file_mtime_change_as_dirty_update() {
+        let path = PathBuf::from("updated-file.txt");
+        let mut old = Snapshot::default();
+        old.insert(path.clone(), item(7, file_kind_with_mtime(10)));
+        let mut next_job_id = 100;
+
+        let events = find_n_diff_item(
+            &old,
+            (path.clone(), file_kind_with_mtime(11)),
+            &mut next_job_id,
+        );
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::Update(event_path, updated_item) => {
+                assert_eq!(event_path, &path);
+                assert_eq!(updated_item.version, 8);
+            }
+            other => panic!("expected dirty update event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn find_n_diff_item_emits_delete_create_for_kind_transitions() {
+        let path = PathBuf::from("kind-change");
+        let mut next_job_id = 5;
+
+        let mut old_dir = Snapshot::default();
+        old_dir.insert(path.clone(), item(2, dir_kind()));
+        let dir_to_file = find_n_diff_item(
+            &old_dir,
+            (path.clone(), file_kind_with_mtime(1)),
+            &mut next_job_id,
+        );
+
+        assert_eq!(dir_to_file.len(), 2);
+        assert!(matches!(&dir_to_file[0], Event::Delete(event_path) if event_path == &path));
+        assert!(
+            matches!(&dir_to_file[1], Event::Create(event_path, created_item)
+            if event_path == &path && matches!(created_item.kind, ItemKind::File(_)))
+        );
+
+        let mut old_file = Snapshot::default();
+        old_file.insert(path.clone(), item(3, file_kind_with_mtime(2)));
+        let file_to_dir = find_n_diff_item(&old_file, (path.clone(), dir_kind()), &mut next_job_id);
+
+        assert_eq!(file_to_dir.len(), 2);
+        assert!(matches!(&file_to_dir[0], Event::Delete(event_path) if event_path == &path));
+        assert!(
+            matches!(&file_to_dir[1], Event::Create(event_path, created_item)
+            if event_path == &path && matches!(created_item.kind, ItemKind::Dir(_)))
+        );
     }
 }

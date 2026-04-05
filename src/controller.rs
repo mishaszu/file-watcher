@@ -3,17 +3,18 @@ use std::time::Duration;
 use tokio::{
     select,
     sync::{mpsc, oneshot},
-    time::interval,
+    time::{interval, sleep},
 };
 
 use crate::{
     Result, Snapshot,
-    diff::{apply_diff, diff_snapshots},
+    diff::{apply_diff, diff_snapshots, find_n_diff_item},
     env::Env,
     hasher::{HashCandidateInfo, HashedInfo, HasherIncomingMsg, HasherReadyMsg},
     model::{Event, Hash, ItemKind, try_send_to_channel},
-    parser::parse_dir_blocking,
+    parser::{parse_dir_blocking, parse_path},
     sink::SinkFileEvent,
+    watcher::{OperationNeeded, WatcherMsg, accept_event},
 };
 
 pub async fn controller(
@@ -23,12 +24,15 @@ pub async fn controller(
     sink_tx: mpsc::Sender<SinkFileEvent>,
     hash_request_tx: mpsc::Sender<HasherIncomingMsg>,
     mut hash_completion_rx: mpsc::Receiver<HasherReadyMsg>,
+    mut watcher_rx: mpsc::Receiver<notify::Result<notify::Event>>,
 ) -> Result<()> {
     let mut ticker = interval(Duration::from_secs(config.interval_sec));
 
     let mut next_job_id = next_job_id;
 
     let mut scan_rx: Option<oneshot::Receiver<Snapshot>> = None;
+
+    let (single_event_tx, mut single_event_rx) = mpsc::channel::<WatcherMsg>(1000);
 
     loop {
         select! {
@@ -44,6 +48,49 @@ pub async fn controller(
                         Ok(())
                     });
                 }
+            }
+            Some(event) = single_event_rx.recv() => {
+                match event {
+                    WatcherMsg::ItemChange((path, item_kind)) => {
+                        let diff = find_n_diff_item(&state, (path, item_kind), &mut next_job_id) ;
+                        queue_for_hash(&diff, Some(sink_tx.clone()), hash_request_tx.clone())?;
+                        let _result = apply_diff(&mut state, diff);
+
+                    },
+                    WatcherMsg::Delete(path) => {
+
+                        state.remove(&path);
+                        try_send_to_channel("Sink", sink_tx.try_send(SinkFileEvent::Delete(path)))?;
+                    },
+                }
+            }
+            Some(event) = watcher_rx.recv() => {
+                if let Ok(event) = event
+                    && let Some(operation) = accept_event(&event) {
+                        let tx = single_event_tx.clone();
+                        tokio::task::spawn(async move {
+                            match operation {
+                                OperationNeeded::Scan(path) => {
+                                    // small debounce to filter out temp dirs
+                                    sleep(Duration::from_millis(100)).await;
+                                    if let Ok(metadata) = std::fs::metadata(&path) {
+                                        if let Ok(event) = parse_path(path, metadata) {
+                                            // TODO: try handle send error
+                                            let _ = tx.send(WatcherMsg::ItemChange(event)).await;
+                                        } else {
+                                            todo!()
+                                        }
+                                    }
+                                }
+                                OperationNeeded::Delete(path) => {
+                                    // it will include temp dir
+                                    if let Err(err) = tx.send(WatcherMsg::Delete(path)).await {
+                                        eprintln!("failed to forward delete event to controller: {err}");
+                                    }
+                                }
+                            }
+                        });
+                    }
             }
             Some(HasherReadyMsg(HashedInfo{path, job_id, new_hash})) = hash_completion_rx.recv() => {
                 if let Some(item) =  state.get_mut(&path)

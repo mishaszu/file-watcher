@@ -9,9 +9,6 @@ use tokio::sync::mpsc::error::TrySendError;
 
 use crate::Result;
 
-#[derive(Debug)]
-pub struct Watcher;
-
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Default)]
 pub enum Hash {
     #[default]
@@ -21,7 +18,7 @@ pub enum Hash {
     Computed(String),
 }
 
-#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone)]
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Default)]
 pub struct FileMetadata {
     pub name: String,
     pub mtime: i64,
@@ -29,7 +26,7 @@ pub struct FileMetadata {
     pub hash: Hash,
 }
 
-#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone)]
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Default)]
 pub struct DirMetadata {
     pub name: String,
 }
@@ -140,6 +137,7 @@ pub enum Event {
 }
 
 impl Event {
+    #[cfg(test)]
     pub fn get_path(&self) -> &PathBuf {
         match self {
             Event::Create(path_buf, _)
@@ -149,6 +147,7 @@ impl Event {
         }
     }
 
+    #[cfg(test)]
     pub fn compare_path(&self, path: &PathBuf) -> bool {
         match self {
             Event::Create(path_buf, _)
