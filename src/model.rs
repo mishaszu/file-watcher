@@ -160,11 +160,12 @@ impl Event {
 
 pub fn try_send_to_channel<T>(
     queue_name: &str,
+    channel: &tokio::sync::mpsc::Sender<String>,
     res: std::result::Result<(), TrySendError<T>>,
 ) -> std::result::Result<(), crate::Error> {
     match res {
         Err(TrySendError::Full(_)) => {
-            eprintln!("{queue_name} channel full; dropping event");
+            let _ = channel.try_send(format!("{queue_name} channel full; dropping event"));
             Ok(())
         }
         Err(TrySendError::Closed(_)) => Err(crate::Error::QueueClosed(format!(
