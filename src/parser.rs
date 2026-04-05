@@ -1,6 +1,9 @@
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{collections::HashMap, fs, os::unix::fs::MetadataExt, path::PathBuf};
 
-use crate::{Result, Snapshot, model::Item};
+use crate::{
+    Error, Result, Snapshot,
+    model::{DirMetadata, FileMetadata, Hash, Item, ItemKind},
+};
 
 pub fn parse_dir_blocking(path: &PathBuf) -> Result<Snapshot> {
     let content = fs::read_dir(path)?;
@@ -27,4 +30,27 @@ pub fn parse_dir_blocking(path: &PathBuf) -> Result<Snapshot> {
     }
 
     Ok(state)
+}
+
+pub fn parse_path(path: PathBuf, metadata: std::fs::Metadata) -> Result<(PathBuf, ItemKind)> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::Path(path.to_owned()))?
+        .to_string_lossy()
+        .into_owned();
+    if metadata.is_file() {
+        Ok((
+            path.to_owned(),
+            ItemKind::File(FileMetadata {
+                name,
+                mtime: metadata.mtime(),
+                size: metadata.size(),
+                hash: Hash::None,
+            }),
+        ))
+    } else if metadata.is_dir() {
+        Ok((path.to_owned(), ItemKind::Dir(DirMetadata { name })))
+    } else {
+        Err(Error::Path(path.to_owned()))
+    }
 }
