@@ -185,7 +185,7 @@ mod tests {
 
     use crate::{
         Snapshot,
-        diff::{apply_diff, diff_snapshots},
+        diff::{apply_diff, diff_snapshots, find_n_diff_item},
         model::{Event, Hash, Item, ItemKind},
     };
 
@@ -487,5 +487,104 @@ mod tests {
 
         assert_eq!(snapshot1, expected);
         assert_eq!(job_id, 1);
+    }
+
+    fn file_kind_with_mtime(mtime: i64) -> ItemKind {
+        let mut kind = ItemKind::File(Default::default());
+        if let ItemKind::File(file_metadata) = &mut kind {
+            file_metadata.mtime = mtime;
+        }
+        kind
+    }
+
+    fn dir_kind() -> ItemKind {
+        ItemKind::Dir(Default::default())
+    }
+
+    fn item(version: u64, kind: ItemKind) -> Item {
+        Item { version, kind }
+    }
+
+    #[test]
+    fn find_n_diff_item_creates_new_file_with_pending_new_hash() {
+        let old = Snapshot::default();
+        let path = PathBuf::from("new-file.txt");
+        let mut next_job_id = 41;
+
+        let events = find_n_diff_item(
+            &old,
+            (path.clone(), file_kind_with_mtime(10)),
+            &mut next_job_id,
+        );
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::Create(event_path, created_item) => {
+                assert_eq!(event_path, &path);
+                match &created_item.kind {
+                    ItemKind::File(file_metadata) => {
+                        assert!(matches!(file_metadata.hash, Hash::PendingNew(41)));
+                    }
+                    ItemKind::Dir(_) => panic!("expected file create event"),
+                }
+            }
+            other => panic!("expected create event, got {other:?}"),
+        }
+        assert_eq!(next_job_id, 42);
+    }
+
+    #[test]
+    fn find_n_diff_item_marks_file_mtime_change_as_dirty_update() {
+        let path = PathBuf::from("updated-file.txt");
+        let mut old = Snapshot::default();
+        old.insert(path.clone(), item(7, file_kind_with_mtime(10)));
+        let mut next_job_id = 100;
+
+        let events = find_n_diff_item(
+            &old,
+            (path.clone(), file_kind_with_mtime(11)),
+            &mut next_job_id,
+        );
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::Update(event_path, updated_item) => {
+                assert_eq!(event_path, &path);
+                assert_eq!(updated_item.version, 8);
+            }
+            other => panic!("expected dirty update event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn find_n_diff_item_emits_delete_create_for_kind_transitions() {
+        let path = PathBuf::from("kind-change");
+        let mut next_job_id = 5;
+
+        let mut old_dir = Snapshot::default();
+        old_dir.insert(path.clone(), item(2, dir_kind()));
+        let dir_to_file = find_n_diff_item(
+            &old_dir,
+            (path.clone(), file_kind_with_mtime(1)),
+            &mut next_job_id,
+        );
+
+        assert_eq!(dir_to_file.len(), 2);
+        assert!(matches!(&dir_to_file[0], Event::Delete(event_path) if event_path == &path));
+        assert!(
+            matches!(&dir_to_file[1], Event::Create(event_path, created_item)
+            if event_path == &path && matches!(created_item.kind, ItemKind::File(_)))
+        );
+
+        let mut old_file = Snapshot::default();
+        old_file.insert(path.clone(), item(3, file_kind_with_mtime(2)));
+        let file_to_dir = find_n_diff_item(&old_file, (path.clone(), dir_kind()), &mut next_job_id);
+
+        assert_eq!(file_to_dir.len(), 2);
+        assert!(matches!(&file_to_dir[0], Event::Delete(event_path) if event_path == &path));
+        assert!(
+            matches!(&file_to_dir[1], Event::Create(event_path, created_item)
+            if event_path == &path && matches!(created_item.kind, ItemKind::Dir(_)))
+        );
     }
 }

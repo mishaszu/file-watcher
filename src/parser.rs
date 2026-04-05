@@ -48,7 +48,9 @@ pub fn parse_path(path: PathBuf, metadata: std::fs::Metadata) -> Result<(PathBuf
                 hash: Hash::None,
             }),
         ))
-    } else {
+    } else if metadata.is_dir() {
         Ok((path.to_owned(), ItemKind::Dir(DirMetadata { name })))
+    } else {
+        Err(Error::Path(path.to_owned()))
     }
 }

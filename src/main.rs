@@ -58,7 +58,9 @@ async fn main() -> Result<()> {
 
     let mut watcher = notify::recommended_watcher(move |res| {
         // non-blocking but might miss events
-        let _ = watcher_tx.try_send(res);
+        if let Err(err) = watcher_tx.try_send(res) {
+            eprintln!("FileWatcher: failed to forward watcher event: {err}");
+        }
     })
     .map_err(Error::Notify)?;
 

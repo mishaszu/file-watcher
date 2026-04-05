@@ -84,8 +84,9 @@ pub async fn controller(
                                 }
                                 OperationNeeded::Delete(path) => {
                                     // it will include temp dir
-                                    let _ = tx.send(WatcherMsg::Delete(path)).await;
-                                    // TODO: try handle send error
+                                    if let Err(err) = tx.send(WatcherMsg::Delete(path)).await {
+                                        eprintln!("failed to forward delete event to controller: {err}");
+                                    }
                                 }
                             }
                         });
