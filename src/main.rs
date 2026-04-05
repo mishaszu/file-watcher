@@ -1,6 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use dotenv::dotenv;
+use notify::{Event, RecursiveMode, Watcher};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -20,17 +21,24 @@ mod hasher;
 mod model;
 mod parser;
 mod sink;
+mod watcher;
 
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("io error {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("notify error {0}")]
+    Notify(#[from] notify::Error),
+
     #[error("queue channel was closed: {0}")]
     QueueClosed(String),
 
     #[error("semaphore was closed, can't issue new permits")]
     SemaphoreClosed,
+
+    #[error("wrong path for an item {0}")]
+    Path(PathBuf),
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -45,6 +53,16 @@ async fn main() -> Result<()> {
     let (file_event_tx, file_event_rx) = mpsc::channel::<SinkFileEvent>(100);
     let (hash_request_tx, hash_request_rx) = mpsc::channel::<HasherIncomingMsg>(100);
     let (hash_completion_tx, hash_completion_rx) = mpsc::channel::<HasherReadyMsg>(100);
+
+    let (watcher_tx, watcher_rx) = mpsc::channel::<notify::Result<Event>>(100);
+
+    let mut watcher = notify::recommended_watcher(move |res| {
+        // non-blocking but might miss events
+        let _ = watcher_tx.try_send(res);
+    })
+    .map_err(Error::Notify)?;
+
+    watcher.watch(&config.root_dir.clone(), RecursiveMode::Recursive)?;
 
     tokio::spawn(async {
         if let Err(err) = hash_worker(hash_request_rx, hash_completion_tx).await {
@@ -81,6 +99,7 @@ async fn main() -> Result<()> {
         file_event_tx,
         hash_request_tx,
         hash_completion_rx,
+        watcher_rx,
     )
     .await?;
 

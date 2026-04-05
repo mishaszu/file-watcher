@@ -9,9 +9,6 @@ use tokio::sync::mpsc::error::TrySendError;
 
 use crate::Result;
 
-#[derive(Debug)]
-pub struct Watcher;
-
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Default)]
 pub enum Hash {
     #[default]
@@ -139,6 +136,7 @@ pub enum Event {
     Delete(PathBuf),
 }
 
+#[allow(dead_code)]
 impl Event {
     pub fn get_path(&self) -> &PathBuf {
         match self {
