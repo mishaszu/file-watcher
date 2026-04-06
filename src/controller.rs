@@ -17,14 +17,33 @@ use crate::{
     watcher::{OperationNeeded, WatcherMsg, accept_event},
 };
 
+pub struct ControllerDeps {
+    pub config: Env,
+    pub sink_tx: mpsc::Sender<SinkFileEvent>,
+    pub hash_request_tx: mpsc::Sender<HasherIncomingMsg>,
+    pub hash_completion_rx: mpsc::Receiver<HasherReadyMsg>,
+    pub watcher_rx: mpsc::Receiver<notify::Result<notify::Event>>,
+    pub error_tx: mpsc::Sender<String>,
+}
+
+pub struct ControllerState {
+    pub snapshot: Snapshot,
+    pub next_job_id: u64,
+}
+
 pub async fn controller(
-    config: Env,
-    mut state: Snapshot,
-    next_job_id: u64,
-    sink_tx: mpsc::Sender<SinkFileEvent>,
-    hash_request_tx: mpsc::Sender<HasherIncomingMsg>,
-    mut hash_completion_rx: mpsc::Receiver<HasherReadyMsg>,
-    mut watcher_rx: mpsc::Receiver<notify::Result<notify::Event>>,
+    ControllerState {
+        mut snapshot,
+        next_job_id,
+    }: ControllerState,
+    ControllerDeps {
+        config,
+        sink_tx,
+        hash_request_tx,
+        mut hash_completion_rx,
+        mut watcher_rx,
+        error_tx,
+    }: ControllerDeps,
 ) -> Result<()> {
     let mut ticker = interval(Duration::from_secs(config.interval_sec));
 
@@ -52,15 +71,19 @@ pub async fn controller(
             Some(event) = single_event_rx.recv() => {
                 match event {
                     WatcherMsg::ItemChange((path, item_kind)) => {
-                        let diff = find_n_diff_item(&state, (path, item_kind), &mut next_job_id) ;
-                        queue_for_hash(&diff, Some(sink_tx.clone()), hash_request_tx.clone())?;
-                        let _result = apply_diff(&mut state, diff);
+                        let diff = find_n_diff_item(&snapshot, (path, item_kind), &mut next_job_id) ;
+                        queue_for_hash(&diff, Some(&sink_tx), &hash_request_tx, &error_tx)?;
+                        let results = apply_diff(&mut snapshot, diff);
+
+                        for result in results {
+                            let _ = error_tx.try_send(result.to_string());
+                        }
 
                     },
                     WatcherMsg::Delete(path) => {
 
-                        state.remove(&path);
-                        try_send_to_channel("Sink", sink_tx.try_send(SinkFileEvent::Delete(path)))?;
+                        snapshot.remove(&path);
+                        try_send_to_channel("Sink", &error_tx, sink_tx.try_send(SinkFileEvent::Delete(path)))?;
                     },
                 }
             }
@@ -68,6 +91,7 @@ pub async fn controller(
                 if let Ok(event) = event
                     && let Some(operation) = accept_event(&event) {
                         let tx = single_event_tx.clone();
+                        let error_tx = error_tx.clone();
                         tokio::task::spawn(async move {
                             match operation {
                                 OperationNeeded::Scan(path) => {
@@ -75,17 +99,18 @@ pub async fn controller(
                                     sleep(Duration::from_millis(100)).await;
                                     if let Ok(metadata) = std::fs::metadata(&path) {
                                         if let Ok(event) = parse_path(path, metadata) {
-                                            // TODO: try handle send error
-                                            let _ = tx.send(WatcherMsg::ItemChange(event)).await;
+                                            if let Err(err) = tx.send(WatcherMsg::ItemChange(event)).await {
+                                                let _ = error_tx.try_send(err.to_string());
+                                            };
                                         } else {
-                                            todo!()
+                                            let _ = error_tx.try_send("Can't read file which change was reported by watcher".to_string());
                                         }
                                     }
                                 }
                                 OperationNeeded::Delete(path) => {
                                     // it will include temp dir
                                     if let Err(err) = tx.send(WatcherMsg::Delete(path)).await {
-                                        eprintln!("failed to forward delete event to controller: {err}");
+                                        let _ = error_tx.try_send(format!("failed to forward delete event to controller: {err}"));
                                     }
                                 }
                             }
@@ -93,7 +118,7 @@ pub async fn controller(
                     }
             }
             Some(HasherReadyMsg(HashedInfo{path, job_id, new_hash})) = hash_completion_rx.recv() => {
-                if let Some(item) =  state.get_mut(&path)
+                if let Some(item) =  snapshot.get_mut(&path)
                     && let ItemKind::File(metadata) = &mut item.kind {
                     let should_send_update = match &mut metadata.hash {
                         Hash::PendingNew(assigned_job_id) if *assigned_job_id == job_id => {
@@ -113,7 +138,7 @@ pub async fn controller(
                         }
                     };
                     if should_send_update {
-                        try_send_to_channel("Sink", sink_tx.try_send(SinkFileEvent::Update(path.clone())))?;
+                        try_send_to_channel("Sink", &error_tx, sink_tx.try_send(SinkFileEvent::Update(path.clone())))?;
                     }
                 }
             }
@@ -124,9 +149,13 @@ pub async fn controller(
                 }
             }, if scan_rx.is_some() => {
                 if let Some(new_snapshot) = res {
-                    let diff = diff_snapshots(&state, &new_snapshot, &mut next_job_id);
-                    queue_for_hash(&diff, Some(sink_tx.clone()), hash_request_tx.clone())?;
-                    let _result = apply_diff(&mut state, diff);
+                    let diff = diff_snapshots(&snapshot, &new_snapshot, &mut next_job_id);
+                    queue_for_hash(&diff, Some(&sink_tx), &hash_request_tx, &error_tx)?;
+                    let results = apply_diff(&mut snapshot, diff);
+
+                    for result in results {
+                        let _ = error_tx.try_send(result.to_string());
+                    }
                 }
 
                 scan_rx = None;
@@ -137,16 +166,17 @@ pub async fn controller(
 
 pub fn queue_for_hash(
     diff: &[Event],
-    sink_tx: Option<mpsc::Sender<SinkFileEvent>>,
-    hash_request_tx: mpsc::Sender<HasherIncomingMsg>,
+    sink_tx: Option<&mpsc::Sender<SinkFileEvent>>,
+    hash_request_tx: &mpsc::Sender<HasherIncomingMsg>,
+    error_tx: &mpsc::Sender<String>,
 ) -> Result<()> {
     for event in diff {
         let sink_event: Option<SinkFileEvent> = event.try_into().ok();
 
         if let Some(sink_event) = sink_event
-            && let Some(ref sink_tx) = sink_tx
+            && let Some(sink_tx) = sink_tx
         {
-            try_send_to_channel("Sink", sink_tx.try_send(sink_event))?;
+            try_send_to_channel("Sink", error_tx, sink_tx.try_send(sink_event))?;
         }
 
         match event {
@@ -162,6 +192,7 @@ pub fn queue_for_hash(
                             };
                             try_send_to_channel(
                                 "Hasher",
+                                error_tx,
                                 hash_request_tx.try_send(HasherIncomingMsg(info)),
                             )?;
                         }

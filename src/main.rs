@@ -3,13 +3,14 @@ use std::{collections::HashMap, path::PathBuf, time::Duration};
 use dotenv::dotenv;
 use notify::{Event, RecursiveMode, Watcher};
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::{select, sync::mpsc};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
-    controller::{controller, queue_for_hash},
+    controller::{ControllerDeps, ControllerState, controller, queue_for_hash},
     diff::diff_snapshots,
     hasher::{HasherIncomingMsg, HasherReadyMsg, hash_worker},
-    model::Item,
+    model::{Item, try_send_to_channel},
     parser::parse_dir_blocking,
     sink::{SinkFileEvent, sink_watcher},
 };
@@ -49,6 +50,7 @@ pub type Snapshot = HashMap<PathBuf, Item>;
 async fn main() -> Result<()> {
     dotenv().ok();
     let (config, sink_kind) = env::Env::new();
+    let token = CancellationToken::new();
 
     let (file_event_tx, file_event_rx) = mpsc::channel::<SinkFileEvent>(100);
     let (hash_request_tx, hash_request_rx) = mpsc::channel::<HasherIncomingMsg>(100);
@@ -56,54 +58,89 @@ async fn main() -> Result<()> {
 
     let (watcher_tx, watcher_rx) = mpsc::channel::<notify::Result<Event>>(100);
 
+    let (error_tx, mut error_rx) = mpsc::channel::<String>(100);
+
+    let controller_deps = ControllerDeps {
+        config: config.clone(),
+        sink_tx: file_event_tx,
+        hash_request_tx: hash_request_tx.clone(),
+        hash_completion_rx,
+        watcher_rx,
+        error_tx: error_tx.clone(),
+    };
+
+    let watcher_token = token.clone();
+    let watcher_error_tx = error_tx.clone();
     let mut watcher = notify::recommended_watcher(move |res| {
         // non-blocking but might miss events
-        if let Err(err) = watcher_tx.try_send(res) {
-            eprintln!("FileWatcher: failed to forward watcher event: {err}");
+        match try_send_to_channel("Watcher", &watcher_error_tx, watcher_tx.try_send(res)) {
+            Ok(_) => (),
+            Err(err) => {
+                eprintln!("{err}");
+                watcher_token.cancel();
+            }
         }
     })
     .map_err(Error::Notify)?;
 
     watcher.watch(&config.root_dir.clone(), RecursiveMode::Recursive)?;
 
-    tokio::spawn(async {
+    // hasher task
+    let hasher_token = token.clone();
+    tokio::spawn(async move {
         if let Err(err) = hash_worker(hash_request_rx, hash_completion_tx).await {
-            // TODO: it should trigger shotdown
             eprintln!("hash worker failed: {err}");
+            hasher_token.cancel();
         }
     });
 
+    // sink task
     tokio::spawn(async {
         match sink_kind {
             sink::SinkKind::Stdout(sink) => sink_watcher(sink, file_event_rx).await,
         }
     });
 
+    // error sink task
+    tokio::spawn(async move {
+        while let Some(event) = error_rx.recv().await {
+            eprintln!("{event}");
+        }
+    });
+
+    // init state
     let mut next_job_id = 0;
     println!("FileWatcher: building root directory snapshot");
     let state = parse_dir_blocking(&config.root_dir)?;
     let diff = diff_snapshots(&HashMap::new(), &state, &mut next_job_id);
+    let controller_state = ControllerState {
+        next_job_id,
+        snapshot: state,
+    };
 
-    let hash_request_tx2 = hash_request_tx.clone();
+    let initial_hasher_token = token.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        if let Err(err) = queue_for_hash(&diff, None, hash_request_tx2) {
-            // TODO: it should trigger shotdown
+        if let Err(err) = queue_for_hash(&diff, None, &hash_request_tx, &error_tx) {
             eprintln!("FileWatcher: failed to queue initial hash requests: {err}");
+            initial_hasher_token.cancel();
         }
     });
 
     println!("FileWatcher: starting watcher");
-    controller(
-        config,
-        state,
-        next_job_id,
-        file_event_tx,
-        hash_request_tx,
-        hash_completion_rx,
-        watcher_rx,
-    )
-    .await?;
+
+    select! {
+        _ = token.cancelled() => (),
+        res = controller(
+                controller_state,
+                controller_deps
+            ) => {
+            if let Err(err) = res {
+                eprintln!("{err:#?}");
+                token.cancel();
+            }
+        }
+    }
 
     Ok(())
 }

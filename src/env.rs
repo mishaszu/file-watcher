@@ -2,6 +2,7 @@ use std::{env, path::PathBuf, str::FromStr};
 
 use crate::sink::{SinkKind, stdout_sink::StdoutSink};
 
+#[derive(Debug, Clone)]
 pub struct Env {
     pub interval_sec: u64,
     pub root_dir: PathBuf,
