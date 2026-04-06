@@ -2,6 +2,97 @@
 
 A simple recursive directory watcher that reports file and directory changes.
 
+## Project Description
+
+### Requirements
+
+FileWatcher requires the following environment variables:
+
+- **`WATCH_DIR`** — directory to watch for changes.  
+  **Important:** must be an absolute path for the system watcher to work correctly.
+
+- **`INTERVAL_SEC`** — interval (in seconds) for periodic full scans.  
+  Most changes are captured by the filesystem watcher, but in edge cases events may be missed.  
+  Periodic scanning ensures correctness and can be configured to run less frequently (e.g. every 300 seconds).
+
+### Project Trade-offs
+
+#### No rename handling
+Rename detection is intentionally not implemented.
+
+Handling renames correctly introduces significant complexity (e.g. move detection, inode tracking, race conditions). Given time constraints, this was excluded.
+
+#### No robust temp file filtering
+Filesystem watchers do not provide a reliable way to distinguish temporary files (e.g. editor artifacts).
+
+A simple debounce mechanism is used to reduce noise from short-lived files, but:
+- there is no reliable system-level signal to identify temporary files
+- some noise may still appear in events
+
+#### Error handling
+
+Two categories of errors are used:
+
+##### 1. Non-breaking errors
+- Logged to stderr via a simple sink
+- Do not stop the system
+- Could be improved with structured error handling and retry logic
+
+##### 2. Breaking errors
+- Trigger global shutdown using `CancellationToken`
+- Examples:
+  - core channels closed
+  - filesystem becomes unreadable
+
+In a production system, these cases would likely trigger retries instead of immediate shutdown.
+
+#### At-most-once delivery
+
+To avoid blocking the controller, `try_send` is used for channel communication.
+
+This introduces **at-most-once semantics**, meaning events may be dropped:
+
+1. **Watcher events dropped**  
+   → recovered by periodic full scan
+
+2. **Hasher events dropped**  
+   → hash may become stale; updates with same size/mtime may be missed
+
+3. **Sink queue full**  
+   → events are dropped and not retried
+
+Retry mechanisms were not implemented due to time constraints.
+
+#### Controller design (`loop + select`)
+
+The controller uses a `loop + tokio::select!` pattern.
+
+Important considerations:
+
+- All futures inside `select!` must be **cancellation-safe**
+- Awaiting long operations directly inside `select!` can lead to partial progress being cancelled
+- Therefore:
+  - blocking work is offloaded (`spawn_blocking`)
+  - async work is delegated to separate tasks
+
+#### `select!` complexity
+
+Due to time constraints, `select!` branches in the controller are relatively large.
+
+In a production system, these would be:
+- extracted into smaller functions
+- better structured for readability and maintainability
+
+#### Channel sizing
+
+Channel capacities were chosen arbitrarily for simplicity.
+
+In a real system, they should be tuned based on:
+- workload characteristics
+- filesystem size
+- hardware (CPU, IO throughput)
+- latency requirements
+
 ## Solution Design
 ### Problem Breakdown
 1. Initial parsing & periodic reconciliation
@@ -99,3 +190,25 @@ The final design is a hybrid event-driven + reconciliation system:
 - Periodic scans ensure correctness
 - Controller maintains consistent state and emits changes
 - Hashing is offloaded and performed only when necessary
+
+## AI Usage
+
+### Problem Discovery & Design
+
+**ChatGPT:**
+- Used to validate the overall architecture (`loop + select + channels`).  
+  The discussion was exploratory, but confirmed this is a reasonable design.
+- Discussed using `try_send` in the controller to avoid blocking and confirmed this trade-off is acceptable.
+- Suggested grouping controller parameters into structs to improve code clarity and reduce argument count.
+- Helped identify the `notify` library as a cross-platform solution (after recalling platform-specific APIs like `inotify`).
+- Provided additional context on filesystem watchers (`inotify`) and their limitations, which led to the decision to include periodic full scans.
+- Assisted with `tokio::select!` patterns, including handling one-shot channels for full snapshot processing.
+- Redact this README from my notes
+
+### Code Review
+
+**GitHub Copilot:**
+- Used for PR reviews.
+- Often provided generic feedback, but occasionally helped identify real issues in:
+  - control flow
+  - small logic mistakes
